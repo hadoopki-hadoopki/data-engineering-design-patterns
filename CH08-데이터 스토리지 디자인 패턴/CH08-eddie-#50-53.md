@@ -131,6 +131,27 @@
 	    - 쏠린 파티션의 초과분을 별도 버퍼에 저장해두고 다음 micro-batch에서 처리. 대신 그 쏠린 파티션의 데이터 지연(latency)은 늘어나는 대신, 나머지 파티션은 거의 실시간으로 계속 처리 가능
 	    - *backpressure: 처리 속도가 유입 속도를 못 따라갈 때, 넘치는 만큼을 뒤로 미뤄서(버퍼에 쌓아두고) 시스템이 감당 가능한 속도로만 처리하게 만드는 흐름 제어(flow control) 메커니즘
 
+
+		**"넘친다"의 기준: 이번 micro-batch에서 "처리하기로 정해둔 최대량"**
+		
+		- micro-batch 시스템은 보통 "이번 배치에서 파티션당 최대 몇 개의 레코드를 처리할지" 상한선을 설정해둠 (예: Spark Structured Streaming의 `maxOffsetsPerTrigger`, `maxBytesPerTrigger` 같은 설정)
+		- 예: "한 파티션당 이번 batch에서 최대 1,000개 레코드까지만 처리한다"고 설정했다고 하자
+		
+		**구체적 숫자로**
+		
+		- 평소: 한 파티션에 5초마다 500개 레코드 쌓임 → 상한선(1,000개) 안 넘음 → 다 처리
+		- 쏠린 시점: 한 파티션에 5초 사이 5,000개 레코드 쌓임 → 상한선(1,000개) 넘음
+		- 이때 "초과분"이란: 5,000개 중 처리 상한선을 넘는 **4,000개** — 이 4,000개는 이번 batch에서 처리 안 하고 버퍼(Kafka라면 그냥 아직 안 읽은 offset으로) 남겨둠
+		- 이번 batch는 1,000개만 처리하고 끝 → 짧게 끝남 → 다음 batch 바로 시작 가능
+		- 남은 4,000개는 다음 batch, 그다음 batch에서 다시 1,000개씩 나눠서 처리
+		
+		**"데이터 양을 줄여서 처리한다"는 게 아니라, "처리를 여러 batch에 나눠서 분할한다"는 뜻**
+		
+		- 데이터를 버리는 게 아님. 5,000개 전부 언젠가는 다 처리됨
+		- 다만 "한 번에 다 처리" 대신 "여러 번에 걸쳐서 나눠 처리"로 바뀌는 것
+		- 그래서 이 파티션의 데이터는 원래보다 늦게(여러 batch에 걸쳐서) 처리 완료됨 → latency 증가
+
+
 3. **Mutability (파티션 키 변경의 어려움)**
     - 배경: 
 	    - 파티션 키를 바꾸려면 이미 써놓은 모든 데이터를 새 위치로 옮겨야 함
@@ -141,6 +162,7 @@
 	    - 메타데이터 레이어에서만 파티션 스키마를 즉시 바꿀 수 있음(파일 이동 없이). 
 	    - 다만 이건 새로 들어오는 레코드부터만 새 구조 적용, 기존 레코드는 옛날 파티션 구조 그대로 남음
 	    > Q.이거 잡코드 바꿔야하나?
+		    - "어? 그럼 파티션 구조가 day였다가 hour로 바뀌었는데, 이 두 구조가 섞여있는 테이블을 읽는 잡 코드는 예전 구조 읽는 부분이랑 새 구조 읽는 부분을 각각 다르게 처리해야 하는 거 아닌가?"라는 걱정이 자연스럽게 생김
 		    -**잡 코드는 안 바꿔도 된다.** Iceberg의 메타데이터 계층이 이 차이를 알아서 흡수해준다.
 		    - 파티션 스키마가 바뀌면(예: `day` 단위 → `hour` 단위), Iceberg는 "이 시점 이후 새 파일들은 hour 파티션 구조다"라는 정보만 메타데이터에 추가로 기록함
 			-잡 코드에서 `spark.read.table('visits').filter(...)`처럼 테이블을 조회하면, Spark는 Iceberg 메타데이터를 보고 **"이 쿼리 범위에서 옛날 파일은 day 구조로, 새 파일은 hour 구조로 읽어야 한다"는 걸 자동으로 판단**해서 각각 맞는 방식으로 읽어옴
@@ -330,6 +352,19 @@ SELECT * FROM visits_all WHERE event_time >= '2023-11-24 00:00:00' AND event_tim
 - 후: 원본 `event_time`만 필터링해도 Iceberg가 알아서 파티션 매핑. 파생 컬럼 관리 자체가 사라짐
 - 체감: 파티션 구조를 나중에 바꿔도 코드 수정 없음 (앞서 본 partition evolution)
 
+	**Iceberg Hidden Partitioning은 이 파생 컬럼 자체를 사람이 안 만든다**
+	테이블 만들 때 이렇게 선언:
+	```sql
+	CREATE TABLE visits (
+	    visit_id STRING,
+	    change_date TIMESTAMP,
+	    page STRING
+	)
+	PARTITIONED BY (day(change_date))
+	```
+	- (기존) `change_date`라는 원본 컬럼에서 사람이 직접 year/month/day/hour 파생 컬럼을 4개 만들어야 함
+	- `PARTITIONED BY (day(change_date))` — "원본 컬럼 `change_date`를 `day()`라는 함수로 변환한 값 기준으로 파티셔닝하겠다"는 선언
+	- 여기서 중요한 점: **테이블 스키마에 `year`, `month`, `day` 같은 컬럼이 새로 생기지 않음.** 테이블은 여전히 `visit_id`, `change_date`, `page` 세 컬럼만 갖고 있음. 파티션 값은 Iceberg 내부 메타데이터에만 존재하고 사용자 눈에는 "숨겨져(hidden)" 있음 — 그래서 이름이 Hidden Partitioning
 ### **2. Databricks Delta Lake — Liquid Clustering**
 
 - 정체: 전통적인 파티션 컬럼 지정 없이, 자주 조회되는 컬럼들을 클러스터링 키로만 지정하면 Delta Lake가 데이터 배치를 자동으로 최적화해주는 기능
@@ -339,6 +374,19 @@ SELECT * FROM visits_all WHERE event_time >= '2023-11-24 00:00:00' AND event_tim
 	- 클러스터링 키만 지정하면 데이터 배치를 자동 최적화. 파티션 개수를 미리 안 정해도 됨
 - 체감: 
 	- 쿼리 패턴 바뀌어도 재설계 부담 적음
+
+**Liquid Clustering — 예시로**
+```sql
+CREATE TABLE visits (
+    visit_id STRING,
+    change_date TIMESTAMP,
+    user_id STRING,
+    page STRING
+) CLUSTER BY (change_date, user_id)
+```
+- `CLUSTER BY (change_date, user_id)` — 이건 "파티션을 이렇게 나눠라"가 아니라 "이 컬럼들이 자주 조회되니까, 물리적으로 서로 가까운 값끼리 모아둬라"는 힌트
+- 데이터가 명확한 그룹(파티션)으로 안 나뉨. 대신 Delta Lake가 알아서 파일들을 재구성하면서, `change_date`와 `user_id` 값이 비슷한 row들을 같은 파일에 계속 몰아넣음
+- 데이터가 쓰일 때마다(INSERT, UPDATE 등) Delta Lake가 자동으로 "지금 이 파일 배치가 최적인가?"를 판단해서 필요하면 재정렬/재배치
 
 ### **3. AWS Athena / Glue — Partition Projection**
 
@@ -350,6 +398,57 @@ SELECT * FROM visits_all WHERE event_time >= '2023-11-24 00:00:00' AND event_tim
 	- 파티션 값의 규칙만 설정해두면 쿼리 시점에 즉석 계산. 등록 자체가 필요 없음
 - 체감: 
 	- 매시간 자동 생성되는 파티션에서 운영 부담이 확 줄어듦
+
+
+
+
+	**AWS Athena Partition Projection — 예시로**
+	
+	**먼저, 이게 왜 필요한지 — 메타스토어 등록 방식(기존)부터**
+	
+	- Athena/Glue는 S3에 저장된 파일들을 테이블처럼 조회하는 서비스
+	- S3 자체는 그냥 파일 저장소일 뿐이라, "어떤 경로가 어떤 파티션에 해당하는지"를 Athena가 알려면 별도로 등록을 해줘야 함 — 이 등록 정보를 담아두는 곳이 Glue Data Catalog(메타스토어)
+	
+	기존 방식 예시:
+	```sql
+	CREATE EXTERNAL TABLE visits (visit_id STRING, page STRING)
+	PARTITIONED BY (event_date STRING)
+	LOCATION 's3://my-bucket/visits/'
+	```
+
+	```sql
+	ALTER TABLE visits ADD PARTITION (event_date='2024-12-31')
+	LOCATION 's3://my-bucket/visits/event_date=2024-12-31/'
+	```
+	- 새 날짜의 데이터가 S3에 새로 쌓일 때마다, **이 `ADD PARTITION` 문을 매번 실행해서 메타스토어에 "이 경로도 파티션이다"라고 등록**해줘야 함
+	- 매일 자동으로 새 파티션 폴더가 생기는 파이프라인이면, 이 등록 작업도 매일 자동화된 스크립트로 돌려야 함 (`MSCK REPAIR TABLE`로 한 번에 스캔해서 등록하는 방법도 있지만, 파티션 수가 많아지면 이 스캔 자체가 느려짐)
+	- 등록 안 하면? S3에 파일은 있는데 Athena 쿼리에는 그 데이터가 아예 안 잡힘(빈 결과)
+	
+	**Partition Projection — 규칙만 정의**
+	```sql
+	CREATE EXTERNAL TABLE visits (visit_id STRING, page STRING)
+	PARTITIONED BY (event_date STRING)
+	LOCATION 's3://my-bucket/visits/'
+	TBLPROPERTIES (
+	    'projection.enabled' = 'true',
+	    'projection.event_date.type' = 'date',
+	    'projection.event_date.range' = '2024-01-01,NOW',
+	    'projection.event_date.format' = 'yyyy-MM-dd',
+	    'storage.location.template' = 's3://my-bucket/visits/event_date=${event_date}/'
+	)
+	```
+	- 이 코드가 뭘 하는 코드인지: 파티션을 하나하나 등록하는 대신, "event_date는 2024-01-01부터 지금까지 매일 하나씩 생기고, 경로 패턴은 이렇게 생겼다"는 **규칙**만 선언
+	- `projection.event_date.range = '2024-01-01,NOW'`: 파티션 값의 범위(2024-01-01부터 현재까지)
+	- `storage.location.template`: 특정 event_date 값이 주어지면 S3 경로가 어떻게 생성되는지 패턴
+	
+	**쿼리할 때 실제로 뭐가 일어나는지**
+	```sql
+	SELECT * FROM visits WHERE event_date = '2024-12-31';
+	```
+	1. Athena가 메타스토어에서 "2024-12-31 파티션이 등록돼있나" 찾지 않음
+	2. 대신 `TBLPROPERTIES`에 정의된 규칙으로 즉석 계산: "event_date=2024-12-31이면 경로는 `s3://my-bucket/visits/event_date=2024-12-31/`이겠구나"
+	3. 이 경로가 실제로 S3에 존재하는지 확인하고 바로 읽음
+	4. **메타스토어에 이 파티션이 등록돼있는지 여부와 무관하게 동작** — 등록 절차 자체가 필요 없음
 
 **실무 선호 정리**
 - Iceberg/Delta Lake 같은 최신 테이블 포맷을 이미 쓰는 환경 → 1번, 2번이 자연스러운 선택. 파티션 관리 자체를 플랫폼에 위임
@@ -659,17 +758,16 @@ CREATE TABLE dedp.technical_select AS (
 
 **분류 요약**
 
-|기술|방식|적합한 상황|
-|---|---|---|
-|Apache Spark|drop/select + persist|대용량 배치 처리, 여러 출력 테이블 동시 생성|
-|PostgreSQL INSERT INTO...SELECT|기존 테이블에 추가|이미 만들어진 테이블에 지속적으로 데이터 채워야 할 때|
-|PostgreSQL CTAS|새 테이블 생성|처음 한 번 테이블 구조를 정의하며 만들 때|
+| 기술                              | 방식                    | 적합한 상황                         |
+| ------------------------------- | --------------------- | ------------------------------ |
+| Apache Spark                    | drop/select + persist | 대용량 배치 처리, 여러 출력 테이블 동시 생성     |
+| PostgreSQL INSERT INTO...SELECT | 기존 테이블에 추가            | 이미 만들어진 테이블에 지속적으로 데이터 채워야 할 때 |
+| PostgreSQL CTAS                 | 새 테이블 생성              | 처음 한 번 테이블 구조를 정의하며 만들 때       |
 
 
 ## **(5)최신트렌드**
 
 **1. Delta Lake / Iceberg — MERGE 기반 중복 제거 자동화**
-
 - 전: 
 	- `dropDuplicates()`처럼 매 배치마다 직접 중복 제거 로직을 짜야 했음. 이미 저장된 테이블에 새 배치를 반영할 때도 수동으로 병합 로직 필요
 - 후: 
@@ -704,9 +802,11 @@ CREATE TABLE dedp.technical_select AS (
 
 
 
+
 # **패턴 #52: Bucket (버킷)**
 
 한 줄 정의: 고카디널리티 컬럼을 파티션처럼 각자 다른 위치에 두는 대신, 해시로 몇 개 그룹(bucket)으로 묶어서 같은 공간에 colocate하는 패턴.
+- Colocate(콜로케이트) = 같은 물리적 위치에 함께 둔다
 
 ## **(1) 문제상황**
 
@@ -880,7 +980,22 @@ input_dataset.write.bucketBy(50, 'user_id').saveAsTable(table_name)
 - 체감:
     - 버킷 개수를 잘못 예측해도 전체 재작업 없이 점진적으로 조정 가능
 
-
+	**1단계: 클러스터링 키 지정 (사람이 하는 유일한 일)**
+	```sql
+	CREATE TABLE visits (
+	    visit_id STRING, event_time TIMESTAMP, user_id STRING, page STRING
+	) CLUSTER BY (user_id)
+	```
+	- `CLUSTER BY (user_id)` — "이 컬럼으로 자주 조회되니, 물리적으로 잘 묶어달라"는 힌트만 줌. bucket 개수 같은 숫자는 아예 안 정함
+	
+	**2단계: 데이터를 쓸 때 — Hilbert Curve / 클러스터링 알고리즘으로 정렬**
+	- 전통적 버킷팅: `hash(user_id) % N` 이라는 고정 공식으로 값을 N개 그룹 중 하나에 딱 배정
+	- Liquid Clustering: user_id 값들을 공간 채움 곡선(space-filling curve, Z-order와 비슷한 계열의 Hilbert curve 등) 알고리즘으로 정렬해서, **값이 비슷한 row들이 물리적으로 가까운 파일에 놓이도록 배치**
+	- 이 방식은 "몇 개 그룹으로 나눌지"를 미리 정할 필요가 없음 — 그냥 "가까운 값끼리 뭉치게" 하는 정렬 방식이기 때문에, 데이터가 늘어나도 그 정렬 로직 자체는 그대로 적용됨
+	
+	**3단계: 데이터가 계속 들어올 때 — 점진적 재구성(incremental repartitioning)**
+	- 매번 전체 테이블을 다시 재배치하는 게 아니라, **새로 들어온 데이터가 있는 부분만** 기존 배치와 맞춰서 국소적으로 재정렬
+	- 이게 "backfill 없이 자동 최적화"가 되는 핵심 이유: 예전 버킷팅처럼 "개수를 바꾸면 전체를 다시 계산"하는 게 아니라, 새 데이터가 들어올 때마다 그 근처 파일들만 조금씩 다시 정리
 ### **3. Z-Ordering (Delta Lake `OPTIMIZE ZORDER BY`)**
 - 정체:
     - 여러 컬럼을 동시에 고려해서 물리적으로 가까운 값끼리 묶어 재배치하는 다차원 정렬 기법
