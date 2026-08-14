@@ -14,9 +14,17 @@
 2. [레코드 조직화 (Records Organization)](#2-레코드-조직화-records-organization)
    - 패턴 #52: 버킷 (Bucket)
    - 패턴 #53: 정렬기 (Sorter)
-3. [요약](#3-요약)
+3. [조회 성능 최적화 (Read Performance Optimization)](#3-조회-성능-최적화-read-performance-optimization)
+   - 패턴 #54: 메타데이터 강화기 (Metadata Enhancer)
+   - 패턴 #55: 데이터셋 구체화기 (Dataset Materializer)
+   - 패턴 #56: 매니페스트 (Manifest)
+4. [데이터 표현 (Data Representation)](#4-데이터-표현-data-representation)
+   - 패턴 #57: 정규화기 (Normalizer)
+5. [요약](#5-요약)
 
-> 본 문서는 챕터 8 의 앞 두 절 — **#50·#51(8.1 Partitioning), #52·#53(8.2 Records Organization)** — 을 다룸.
+> 본 문서는 챕터 8 의 **#50~#57** — **8.1 Partitioning · 8.2 Records Organization ·
+> 8.3 Read Performance Optimization · 8.4 Data Representation(전반)** — 을 다룸.
+> 마지막 패턴 **#58 Denormalizer** 는 별도로 정리.
 > ※ **#51 Vertical Partitioner** 는 챕터 7 의 **#41 Vertical Partitioner** 와 이름이 같음.
 > **#41 은 보안 특화**(개인정보 삭제·잊힐 권리), **#51 은 스토리지 특화**(불변 속성 중복 저장 제거)로 목적이 다름.
 
@@ -45,7 +53,7 @@
 ──────────────────────────────────────────────────────────────────────
  흐름 — 먼저 나누고(8.1) → 저카디널리티로 안 되는 건 묶고·정렬하고(8.2)
         → 읽을 때 건드릴 것을 줄이고(8.3) → 표현 방식을 고름(8.4).
- ※ 본 문서는 8.1 · 8.2 (#50~#53) 를 다룸.
+ ※ 본 문서는 8.1 · 8.2 · 8.3 · 8.4(#57) — 즉 #50~#57 을 다룸.
 ```
 
 **파티셔닝의 한계가 이 챕터의 이야기 축** — 파티셔닝은 **저카디널리티 값**(어떤 속성의 서로 다른 값이 많지 않을 때)에서만 잘 동작.
@@ -72,8 +80,20 @@
  8.2 Records Organization (레코드를 묶고 정렬하기)
    #52 Bucket — 서로 다른 값을 같은 저장 공간에 묶음 (hash(key) % N) → 파티션 폭증 회피
    #53 Sorter — 디스크에 정렬해 저장 → 무관한 데이터 블록 skip (data skipping)
+      │ (다음) 배치는 다 끝났는데, 읽기 경로에서 더 줄일 게 남았나?
+      ▼
+ 8.3 Read Performance Optimization (읽을 때 건드릴 것을 줄이기)
+   #54 Metadata Enhancer     — 통계(min/max/nulls)로 파일·row 를 열기 전에 걸러 냄
+   #55 Dataset Materializer  — 비싼 쿼리를 1회 구체화해 테이블·MV 로 재사용
+   #56 Manifest              — 파일 목록을 미리 기록해 비싼 리스팅 연산 자체를 제거
+      │ (다음) 접근 경로를 다 줄였다면, 애초에 "무엇을 같이 저장할지" 는?
+      ▼
+ 8.4 Data Representation (표현 방식 고르기)
+   #57 Normalizer            — 정보를 한 번만 저장 (정합성 우선, 대가는 JOIN)
+   #58 Denormalizer          — JOIN 을 줄이거나 없앰 (실행 시간 우선, 대가는 정합성)
 ──────────────────────────────────────────────────────────────────────
- 핵심 — 파티셔닝은 "위치를 나누는" 조잡한 도구, 버킷·정렬은 "그 안에서 잘 배치하는" 정교한 도구.
+ 핵심 — 파티셔닝은 "위치를 나누는" 조잡한 도구, 버킷·정렬은 "그 안에서 잘 배치하는" 정교한 도구,
+        8.3 은 "이미 배치된 것을 덜 건드리는" 도구, 8.4 는 "무엇을 같이 둘지" 를 정하는 도구.
 ```
 
 ---
@@ -1085,10 +1105,871 @@ Z-order·클러스터링은 **주기적 최적화 잡으로 스케줄링** 해 �
 
 ---
 
-## 3. 요약
+## 3. 조회 성능 최적화 (Read Performance Optimization)
 
-챕터 8 의 앞 두 절은 **"데이터를 어떻게 배치해야 빠르고 싸게 읽히나"** 를 **나누기(파티셔닝)** 와
-**묶고 정렬하기(레코드 조직화)** 두 단계로 다룸.
+> 이 절의 패턴들은 **지금까지 본 데이터 조직화 기법을 확장** 해 **데이터 접근을 최적화** 함.
+
+8.1·8.2 가 **"데이터를 어디에 어떻게 놓을지"** 였다면, 8.3 은 **"이미 놓인 데이터를 읽을 때 실제로 몇 개를 건드릴지"** 를 줄이는 절.
+세 패턴이 각각 다른 축을 담당.
+
+- **#54 Metadata Enhancer** — **통계 계층** 을 활용해 **파일·row 를 열기 전에** 걸러 냄 (아래 3-1 절).
+- **#55 Dataset Materializer** — **비싼 계산을 미리 1회 수행** 해 결과를 저장 (아래 3-2 절).
+- **#56 Manifest** — **파일 목록을 미리 기록** 해 **리스팅 연산 자체를 없앰** (아래 3-3 절).
+
+```
+[8.3 세 패턴이 줄이는 대상]
+──────────────────────────────────────────────────────────────────────
+ 쿼리 한 번이 치르는 비용 = ① 파일 목록 알아내기 + ② 파일 열기 + ③ 계산하기
+                             └── #56 Manifest    └── #54 Metadata   └── #55 Dataset
+                                                      Enhancer           Materializer
+──────────────────────────────────────────────────────────────────────
+ 세 패턴은 배타적이지 않음 — Delta Lake 커밋 로그 하나가 #56(파일 목록) 과
+ #54(파일별 min/max·nullCount) 를 동시에 제공하고, 그 위에 #55 를 얹을 수 있음.
+```
+
+---
+
+### 3-1. 패턴 #54: 메타데이터 강화기 (Metadata Enhancer)
+
+> 조회 성능 최적화에 가장 먼저 쓸 수 있는 기법은 **메타데이터** 를 활용하는 것.
+> **Apache Parquet 같은 컬럼형 파일 포맷** 이 오랫동안 데이터 엔지니어링 분야의 **파괴적 변화** 로 여겨져 온 이유 중 하나.
+
+#### 상황 (Problem)
+
+**책의 use case** — 파티셔닝은 했는데 분석가 쿼리가 여전히 느림:
+
+- **JSON 데이터셋을 이벤트 시각(event time)으로 수평 파티셔닝**(#50) 해 배치 잡 실행 시간을 줄였고, **실제로 효과가 있었음**.
+- 그런데 회사가 **새 데이터 분석가들** 을 채용했고, 이들은 같은 파티션 데이터셋에서 작업하되
+  **한 파티션 안의 아주 작은 row 부분집합만** 노림.
+- **파티션이 크기 때문에** 분석가들은 **쿼리 실행 지연** 과 **늘어난 클라우드 청구서** 를 불평 —
+  **종량제(pay-as-you-go) 쿼리 서비스** 에 의존하고 있어서 스캔량이 곧 비용.
+- 분석 결과 — 분석가 쿼리는 **항상 전체 데이터셋을 로드한 뒤 나중에 필터링 로직을 적용** 하고 있었음.
+- **결정적 제약**: 두 연산의 **순서를 뒤집어**, **쿼리 엔진에 데이터셋을 로드하기 전에 필터링** 을 적용해야 함.
+
+#### 해결 (Solution)
+
+쿼리 실행 시간과 비용을 최적화하는 쉬운 길은 **무관한 데이터 파일을 처리 전에 전부 스킵** 하는 것.
+구현은 **저장된 레코드에 대한 통계를 수집해 파일 또는 데이터베이스에 영속화** 하는 것으로 이루어짐.
+
+- **파일 구현 — 컬럼형 포맷의 footer**
+  - Apache Parquet 같은 **컬럼형 파일 포맷** 에 적용. 각 데이터 파일이 **추가 메타데이터를 담은 footer** 를 가짐.
+  - 이름 그대로 컬럼형 포맷은 **파일에 컬럼을 저장**, 통계는 **파일 국소적**(그 파일의 값만 기술).
+  - footer 의 **값 범위(min/max)** 는 **프로듀서가 파일을 만들 때 자동으로 계산** 됨.
+- **동작 방식** — 사용자가 술어에 `age` 컬럼을 쓰면(`SELECT ... FROM table WHERE age > 50`),
+  쿼리 실행 엔진은 **메타데이터 footer 만 확인** 해 요청한 `age` 가 그 파일에 포함되는지 판단.
+  - **footer 가 데이터 블록보다 작으므로** 필터링이 **축소된 데이터셋 위에서** 일어나 훨씬 빠름.
+  - 단 **모든 footer 를 읽는 오버헤드는 남음**. 그래도 **전체 데이터 파일을 읽는 것과는 비교가 안 될 정도로 작음**.
+- **테이블 파일 포맷으로 자동 확장** — Parquet 이 테이블 파일 포맷의 저장 포맷이므로,
+  이 패턴은 **Delta Lake · Apache Iceberg · Apache Hudi 에서 자동으로 사용 가능**.
+  - 이들 포맷은 Parquet 통계에 더해 **커밋 로그에 추가 메타데이터** 를 저장 —
+    **커밋에서 생성된 row 수**, **컬럼별 min/max**, **컬럼별 NULL 개수**.
+  - 덕분에 **원소 개수를 세는 쿼리** 나 **존재하지 않는 값에 대한 필터링** 을 매우 빠르게 수행.
+- **파일만이 아님** — **관계형 데이터베이스·데이터 웨어하우스의 테이블** 에서도 같은 종류의 통계를 찾을 수 있음.
+  이쪽에서는 통계가 **별도 테이블** 에 놓이고, **쿼리 플래너** 가 그것을 활용해 **가장 효율적인 실행 계획** 을 만듦.
+
+```
+[Figure 8-7 재현] Apache Parquet 파일의 메타데이터 footer
+──────────────────────────────────────────────────────────────────────
+                      ┌─────────────────┐
+                      │       Age       │   ← 컬럼 (컬럼형 포맷)
+                      ├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+                      │       19        │
+                      │       24        │
+                      │       50        │   ← 실제 데이터 블록
+                      │       33        │      (크고, 읽으면 비쌈)
+                      │       38        │
+                      │       39        │
+                      │       40        │
+                      ├─────────────────┤
+                      │     Stats:      │
+                      │     min=19      │   ← footer (작고, 읽으면 쌈)
+                      │     max=50      │
+                      │     nulls=0     │
+                      └─────────────────┘
+──────────────────────────────────────────────────────────────────────
+ 프로듀서가 파일을 쓸 때 min/max/nulls 를 자동 계산해 footer 에 붙임.
+ `WHERE age > 50` ⇒ 엔진이 footer 의 max=50 만 보고 ✓ 이 파일 전체를 스킵.
+ ⚠ footer 를 "전부" 읽는 비용은 남음 — 단 데이터 블록 전체를 읽는 비용과는 비교 불가.
+```
+
+```
+[읽기 경로 비교 — 강화기 적용 전후]
+──────────────────────────────────────────────────────────────────────
+ ✗ 적용 전 (JSON, 통계 없음)
+   파일1 전부 로드 ─┐
+   파일2 전부 로드 ─┼─► 쿼리 엔진 ─► WHERE age > 50 필터 ─► 결과 3건
+   파일3 전부 로드 ─┘        ▲
+                             └── 스캔량 = 전체. 종량제라면 비용도 전체분.
+
+ ✓ 적용 후 (Parquet, footer 통계)
+   파일1 footer(min=19,max=50) ⇒ skip
+   파일2 footer(min=51,max=88) ⇒ 로드 ─► 쿼리 엔진 ─► 결과 3건
+   파일3 footer(min=10,max=45) ⇒ skip
+                             ▲
+                             └── 스캔량 = 파일2 + footer 3개.
+──────────────────────────────────────────────────────────────────────
+ 핵심 — "로드한 뒤 필터" 를 "필터한 뒤 로드" 로 뒤집는 것이 이 패턴의 전부.
+```
+
+#### 고려사항 (Consequences)
+
+Metadata Enhancer 는 **단점을 찾기 어려운 패턴**. 그나마 있는 것이 **이 추가 계층의 비용** 에 관한 것.
+
+- **Overhead (오버헤드)**
+  - 컬럼형 파일 포맷에서 **쓰기 시점에 통계를 만드는 것은 쓰기 잡이 수행해야 할 추가 연산**.
+    처리하는 **컬럼마다 설정된 통계를 유지** 해야 하므로 **처리 시간에 약간의 영향**.
+  - 관계형 DB·데이터 웨어하우스에서는 **데이터스토어가 통계를 최신으로 유지** 해야 함.
+    그러지 않으면 **실행 계획이 최적과 한참 멀어질 수 있음**.
+  - **대응** — 통계가 낡았을 때 **갱신을 담당하는 명령을 실행**.
+- **Out-of-date statistics (낡은 통계)**
+  - 관계형 DB·데이터 웨어하우스에서 통계가 **자동 갱신되더라도 즉시는 아님**.
+    갱신 실행은 **임계치**(예: 마지막 갱신 이후 수정된 row 수)로 제어되는 경우가 많음.
+  - 따라서 테이블이 **가끔 작은 변경만 겪어 임계치에 도달하지 못하면**, 통계는 **시간이 갈수록 낡아짐**.
+  - **완화책** — `ANALYZE TABLE` 같은 명령으로 **수동 갱신**.
+    단 테이블을 처리해 통계를 새로 만들어야 하므로 **DB 에 일시적 읽기 오버헤드** 가 추가된다는 점을 염두에 둘 것.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Apache Parquet 쓰기 (Example 8-13)**
+
+가장 기본적인 예. Spark 에서는 **적절한 데이터 라이터를 쓰기만 하면** 통계가 **내부적으로 알아서 생성** 됨:
+```python
+input_dataset.write.mode('overwrite').parquet(path=get_parquet_dir())
+```
+
+**예시 2 — Parquet 메타데이터 확인 (Example 8-14)**
+
+생성된 통계 내용은 아래와 같은 Docker 명령으로 확인:
+```bash
+docker run --rm -v "./output-parquet:/tmp/parquet" \
+  hangxie/parquet-tools:v1.20.7 meta \
+  /tmp/parquet/part-00001-3c52ae6f-aeea-4364-aac3-7fc69d63e898-c000.snappy.parquet
+```
+
+**예시 3 — Parquet 통계 출력 (Example 8-15)**
+
+출력은 **컬럼마다 통계** 를 찍음. 아래는 `Id` 컬럼의 경우:
+```json
+"NumRowGroups": 1, {"PathInSchema": ["Id"], "Type": "BYTE_ARRAY",
+ "Encodings": ["PLAIN", "RLE", "BIT_PACKED"],"CompressedSize": 180463,
+ "UncompressedSize": 200035,"NumValues": 5000,
+ "NullCount": 0, "MaxValue": "fffbe4f8-8d88-43d2-a9a5-54bf536de75b",
+ "MinValue": "0018e1dc-1b80-4410-92f6-5261d2dadf35",
+ "CompressionCodec": "SNAPPY"}
+```
+
+> `MinValue`/`MaxValue`/`NullCount` 가 **데이터 스키핑의 근거**.
+> `NumValues` 는 **count 쿼리** 를, `NullCount` 는 **`IS NULL` 필터** 를 데이터 블록을 안 열고 처리하게 해 줌.
+
+**예시 4 — Delta Lake 커밋 로그의 통계 (Example 8-16)**
+
+Delta Lake 는 Parquet 메타데이터 **위에 한 겹을 더** 얹음. **커밋 로그** 에 들어가며, Parquet 과 마찬가지로
+**명시적으로 생성할 필요 없이** 처리 프레임워크가 알아서 채움:
+```json
+{"commitInfo":{"timestamp":1716954694590,"operation":"WRITE",
+"operationMetrics":{"numFiles":"1",
+"numOutputRows":"6100",
+"numOutputBytes":"50437"}," ...}
+{"add":{"path":"part-...-c000.snappy.parquet, "size":50437,
+"stats":"{
+ \"numRecords\":6100,
+ \"minValues\":
+   {\"type\":\"galaxy\",\"full_name\":\"APPLE iPhone 11 (White, 64 GB)\",
+    \"version\":\"Android 10\"},
+ \"maxValues\":
+   {\"type\":\"mac\",\"full_name\":\"Yoga 7i (14\\\" Intel) 2 in 1 Lapto\",
+    \"version\":\"v17169535721658688\"},
+ \"nullCount\":{\"type\":0,\"full_name\":0,\"version\":0}}"}}
+```
+
+| 계층 | 통계 위치 | 담는 값 | 갱신 주체 |
+|---|---|---|---|
+| **Apache Parquet** | 각 데이터 파일의 footer | 컬럼별 min/max, NullCount, NumValues | 프로듀서(쓰기 잡)가 자동 |
+| **Delta Lake / Iceberg / Hudi** | 커밋 로그 (메타데이터 위치) | 커밋 row 수, 컬럼별 min/max, nullCount | 처리 프레임워크가 자동 |
+| **관계형 DB / DW** | 별도 통계 테이블 | 쿼리 플래너용 분포·카디널리티 통계 | 데이터스토어가 임계치 기반 자동 + `ANALYZE TABLE` 수동 |
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 컬럼 순서·정렬을 신경 쓰지 않고 Parquet 을 쓰면 통계가 있어도 스킵되는 파일이 0개라 최적화 효과가 사라짐.</summary>
+<div markdown="1">
+
+**예 —** 이벤트를 도착 순서대로 그냥 쓰면, 모든 파일의 `event_time` min/max 가
+`[00:00, 23:59]` 로 **거의 전 구간을 덮음**. 하루치 파일 800개 중 `WHERE event_time BETWEEN '13:00' AND '14:00'`
+쿼리가 스킵하는 파일이 **0개** — footer 800개를 추가로 읽은 만큼 오히려 느려짐.
+Delta Lake 는 기본적으로 **앞쪽 32개 컬럼** 에 대해서만 통계를 수집하므로,
+필터 컬럼이 스키마 뒤쪽(예: 87번째)에 있으면 `minValues`/`maxValues` 자체가 아예 비어 있기도 함.
+
+**권장 —** 통계는 **#53 Sorter 와 세트로** 볼 것 — 필터 컬럼으로 정렬(`CLUSTER BY`·Z-order)해야
+파일별 min/max 구간이 좁아져 스킵이 실제로 일어남.
+필터에 자주 쓰는 컬럼은 **스키마 앞쪽에 두거나** `delta.dataSkippingNumIndexedCols` 를 조정할 것.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 통계가 낡은 줄 모르고 실행 계획만 보면 원인 불명의 느린 쿼리를 며칠씩 헤맴.</summary>
+<div markdown="1">
+
+**예 —** 일 배치가 매일 **3만 건씩만** 추가하는 PostgreSQL 테이블은 autovacuum 의
+`analyze_scale_factor`(기본 0.1 = 전체의 10%) 임계치에 몇 달간 도달하지 못함.
+그 사이 테이블이 200만 → 2,000만 건으로 커졌는데 플래너는 옛 통계를 보고
+**Nested Loop** 를 고르며, 3초 걸리던 조인이 **4분** 으로 늘어남.
+`EXPLAIN` 의 `rows=` 추정치와 `EXPLAIN ANALYZE` 의 `actual rows=` 가 **자릿수 단위로 벌어져 있으면** 통계가 낡은 것.
+
+**권장 —** 대량 적재 직후에는 `ANALYZE TABLE` 을 **파이프라인 마지막 단계로 명시적으로 붙일 것**.
+단 통계 생성 자체가 테이블 스캔이므로, **피크 시간대는 피해서** 스케줄링할 것.
+
+</div>
+</details>
+
+---
+
+### 3-2. 패턴 #55: 데이터셋 구체화기 (Dataset Materializer)
+
+> **비싼 연산** 은 데이터 접근 개선의 또 다른 난제. **shuffle 과 CPU 집약적 변환** 이 섞인 쿼리를
+> **몇 번이고 반복 실행** 해야 한다면 성능이 나빠짐.
+> 놀랍게도, 여기서는 **데이터 중복(duplication)** 이 읽기 성능을 개선해 줌.
+
+#### 상황 (Problem)
+
+**책의 use case** — 뷰(view)로는 지연이 해결되지 않음:
+
+- 같은 데이터셋의 **여러 파티션 테이블을 조회해 지난 3주치 데이터** 를 얻는 과정을 **단순화** 하고 싶었음.
+- 그래서 **뷰(view)** 를 만들었지만 컨슈머 (다운스트림)들이 **완전히 만족하지 못함**.
+- 이들은 **지연(latency)** 을 불평했고, 그 말이 맞음 — **뷰는 조회할 때마다 하부 쿼리를 매번 실행** 하기 때문.
+- **결정적 제약**: 이 문제를 풀어서 **성능이 더 나은 단일 데이터 접근점(single point of data access)** 을 제공해야 함.
+
+#### 해결 (Solution)
+
+**결과 계산이 느릴 때 가장 단순한 해법** 은 **데이터를 구체화(materialize)해 문제 자체를 회피** 하는 것.
+Dataset Materializer 패턴이 하는 일이 정확히 그것.
+
+- **구현 순서**
+  - **① 구체화할 데이터셋 식별** — 어떤 것을 물리적으로 저장할지 고름.
+  - **② 구체화 구현** — 보통 적절한 `SELECT` 문으로 데이터를 조회하고, 필요하면 `UNION`·`JOIN` 으로 여러 데이터셋을 결합.
+  - **③ 저장** — 만든 쿼리를 **materialized view 또는 테이블** 로 구체화.
+- **materialized view 와 table 중 무엇을 고를까 — 가장 큰 차이는 refresh**
+  - **materialized view** — **수동 refresh 도 가능** 하지만, 현대 데이터 웨어하우스는 **특정 기준하에 자동 refresh 도 지원**.
+    - 예: **Amazon Redshift** 는 `CREATE MATERIALIZED VIEW` 문에 `AUTO REFRESH YES` 옵션으로 지원.
+    - 단 **하부 테이블을 바꾼 직후 즉시 실행되도록 의도된 것이 아님** — 실행 시점이 **현재 DB 워크로드나 refresh 할 데이터 크기** 에 의존.
+      따라서 **자동이긴 하지만 예측 가능성은 떨어짐**.
+    - Redshift 외에 **GCP BigQuery · Databricks · Snowflake** 등에서도 사용 가능.
+  - **table** — 구체화 데이터셋의 저장소로 테이블을 쓰면 **refresh 는 전적으로 사용자 책임**. 자동 refresh 기능을 활용할 수 없음.
+    - 대신 그 추가 작업의 대가로 **유연성** 을 얻음 — **파티션·버킷·정렬(#50·#52·#53)** 같은
+      **다른 스토리지 최적화 기법의 이점** 을 누릴 수 있고, 이는 materialized view 에서는 못 쓸 수 있는 것들.
+    - 할 일은 더 많아지지만 **운영 유연성과 최적화 수단이 늘어남**.
+
+```
+[뷰 · materialized view · 테이블 — 무엇이 언제 계산되는가]
+──────────────────────────────────────────────────────────────────────
+ ✗ 일반 view — 조회할 때마다 하부 쿼리 재실행
+   조회1 ─► [UNION 3주치 파티션 + JOIN + shuffle] ─► 결과   (느림)
+   조회2 ─► [UNION 3주치 파티션 + JOIN + shuffle] ─► 결과   (또 느림)
+   조회3 ─► [UNION 3주치 파티션 + JOIN + shuffle] ─► 결과   (계속 느림)
+
+ ✓ materialized view — refresh 시점에만 계산, 조회는 저장된 결과를 읽음
+   refresh ─► [UNION + JOIN + shuffle] ─► 저장
+   조회1·2·3 ─► 저장된 결과 읽기                            (빠름)
+   ⚠ 자동 refresh 는 "언제" 돌지 예측하기 어려움 ⇒ 조회가 낡은 데이터를 볼 수 있음
+
+ ✓ table — refresh 를 직접 스케줄, 대신 파티션·버킷·정렬을 얹을 수 있음
+   배치 ─► [UNION + JOIN + shuffle] ─► partitionBy/bucketBy/CLUSTER BY 로 저장
+   조회1·2·3 ─► 프루닝까지 걸린 상태로 읽기                  (더 빠름)
+   ⚠ refresh 는 100% 내 책임
+──────────────────────────────────────────────────────────────────────
+ ⇒ "예측 가능성과 최적화 수단" 을 원하면 table, "운영 부담 최소화" 를 원하면 MV.
+```
+
+#### 고려사항 (Consequences)
+
+**refresh 는 문제가 아니라고 생각한다면 — 유감스럽게도 문제가 될 수 있음.**
+
+- **Refresh cost (갱신 비용)**
+  - 뷰를 refresh 할 때마다 **생성 쿼리를 다시 실행** 해야 함.
+    이 셋업 쿼리가 **데이터 볼륨이나 연산 종류 때문에 비싸다면**, **DB 자원 전체에 영향** —
+    **다른 테이블을 쓰는 일반 사용자에게 돌아갈 자원까지** 잠식.
+  - **완화책 — 증분 refresh(incremental refresh)**: **가장 최근 변경분만 뷰에 통합**.
+    **과거 데이터가 바뀌지 않고 새 레코드만 append 되는 insert-only 워크로드에 완벽히 맞음**.
+  - **Databricks · GCP BigQuery** 는 증분 refresh 를 기본 지원.
+    단 **모든 SQL 연산을 지원하지는 않고**, 경우에 따라 **결국 전체 데이터셋을 다시 refresh** 하기도 함.
+- **Data access (데이터 접근 제어)**
+  - 구체화된 데이터셋은 **여러 테이블을 결합** 하므로 **일관된 데이터 관리**(리텐션·접근 설정)가 어려울 수 있음.
+  - 원칙 — 사용자가 **구성 테이블 중 하나에라도 접근 권한이 없다면 뷰 접근도 계속 거부** 해야 하고,
+    가능하다면 **Fine-Grained Accessor 패턴(챕터 7)** 의 옵션 중 하나를 구현할 것.
+- **Data storage overhead (저장 공간 오버헤드)**
+  - 구체화는 접근을 최적화하지만, 그 최적화를 **저장 공간과 맞바꿈**.
+  - **저장이 부담이라면 혼합 구현** — **뷰의 데이터셋 중 일부만 구체화** 하고,
+    나머지는 **재계산 가능한 일반 부분** 으로 남겨 둠.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — BigQuery 자동 refresh materialized view (Example 8-17)**
+
+GCP BigQuery 는 materialized view 뿐 아니라 **자동 refresh 설정** 까지 지원. 아래는 **15분마다 refresh** 되는 뷰:
+```sql
+CREATE MATERIALIZED VIEW dedp.visits.visits_enriched
+OPTIONS (enable_refresh = true, refresh_interval_minutes = 15)   -- 자동 refresh 주기
+AS SELECT...
+```
+
+> ⚠ **자동 refresh 가 base 테이블 수정 직후에 도는 것은 거의 보장되지 않음**.
+> BigQuery 도 마찬가지로 **변경 후 5분 이내** 에 refresh 를 돌리도록 되어 있지만,
+> **용량이 부족하면 refresh 가 지연됨**.
+
+**예시 2 — PostgreSQL 수동 refresh (Example 8-18)**
+
+그래서 대안으로 **수동 refresh materialized view** 를 쓸 수 있음. PostgreSQL 은 `REFRESH MATERIALIZED VIEW` 를 제공:
+```sql
+REFRESH MATERIALIZED VIEW dedp.windowed_visits WITH DATA;   -- 새 데이터를 뷰에 통합
+```
+
+**예시 3 — 증분 버전 (Example 8-19)**
+
+새 방문 집계를 통합하는 증분 버전. 입력 테이블에 **각 row 의 쓰기 시각을 담은 `insertion_time` 컬럼** 이 있고,
+이 컬럼으로 **직전 실행 이후 추가된 row 만 조회** 해 기존 데이터셋과 결합.
+즉 **Incremental Loader 패턴 + Merger 패턴의 결합**:
+```sql
+MERGE INTO dedp.visits_counter AS target
+USING (
+ -- 2024-11-09T03:27:32 은 직전 insertion_time 이후 시각
+ SELECT user_id, COUNT(*) AS visits FROM dedp.visits
+ WHERE insertion_time > '2024-11-09T03:27:32' GROUP BY user_id   -- 증분만 조회
+) AS input
+ON target.user_id = input.user_id
+WHEN MATCHED THEN UPDATE SET count = count + input.visits        -- 기존 카운트에 누적
+WHEN NOT MATCHED THEN INSERT (user_id, count) VALUES (input.user_id, input.visits)
+```
+
+```
+[전체 refresh vs 증분 refresh — 3주 롤링 집계 기준]
+──────────────────────────────────────────────────────────────────────
+ ✗ 전체 refresh
+   매 실행 ─► 21일치 전부 재스캔 → 재집계 → 덮어쓰기
+             비용 = O(21일)  · 실행마다 동일 · DB 자원을 크게 점유
+
+ ✓ 증분 refresh (Incremental Loader + Merger)
+   매 실행 ─► insertion_time > 직전값 인 신규 row 만 스캔 → MERGE
+             비용 = O(신규분) · insert-only 워크로드에 최적
+   ⚠ 과거 데이터가 수정되는 워크로드에서는 증분만으로 정합성이 깨짐
+   ⚠ 지원하지 않는 SQL 연산이면 엔진이 조용히 전체 refresh 로 되돌아감
+──────────────────────────────────────────────────────────────────────
+```
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 자동 refresh 를 믿고 SLA 를 잡으면 "왜 어제 데이터가 안 보이냐" 는 문의가 반복해서 들어옴.</summary>
+<div markdown="1">
+
+**예 —** BigQuery MV 에 `refresh_interval_minutes = 15` 를 걸고 대시보드 SLA 를 "최대 15분 지연" 으로 공지했는데,
+월말 배치가 몰리는 시간대에 슬롯이 부족해 refresh 가 **1시간 넘게 밀림**.
+대시보드에는 에러 없이 **옛 숫자가 그대로** 떠 있어서, 분석가는 데이터가 안 들어온 것인지
+집계가 0인 것인지 구분하지 못함.
+
+**권장 —** MV 를 SLA 대상에 넣을 거라면 **결과에 `last_refreshed_at` 을 함께 노출** 하고,
+지연에 민감한 데이터셋은 **자동 refresh MV 대신 스케줄된 테이블 구체화(+증분 MERGE)** 로 갈 것.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 구체화 뷰에만 권한을 열어 두면 base 테이블의 접근 통제를 우회하는 경로가 생김.</summary>
+<div markdown="1">
+
+**예 —** `visits_enriched` MV 가 `visits` + `users`(이메일·전화번호 포함) 를 조인하는데,
+`users` 는 마케팅팀에 비공개인 테이블. 그런데 MV 에는 마케팅팀 `SELECT` 권한을 그대로 부여해
+**base 테이블에서 막아 둔 PII 가 MV 를 통해 그대로 조회** 됨.
+챕터 7 기준으로는 **Fine-Grained Accessor 로 막았어야 할 컬럼** 이 구체화 시점에 평문으로 복사된 상태.
+
+**권장 —** 구체화 대상 데이터셋의 **접근 정책은 base 테이블 중 가장 엄격한 것을 상속** 시킬 것.
+컬럼 단위로 열어야 한다면 MV 자체가 아니라 **Fine-Grained Accessor(컬럼 마스킹·뷰 분리)** 를 먼저 적용할 것.
+
+</div>
+</details>
+
+---
+
+### 3-3. 패턴 #56: 매니페스트 (Manifest)
+
+> 마지막 조회 성능 난제는 **데이터 리스팅(listing)**.
+> 특히 **파일이 많은 오브젝트 스토어** 에서 느림 — **API 호출이 그만큼 많이 발생** 하기 때문.
+> 리스팅을 **병렬화** 해 완화해 볼 수도 있지만, **더 나은 방법이 있음**.
+
+#### 상황 (Problem)
+
+**책의 use case** — 배치는 빨라졌는데 웨어하우스 노출이 느림:
+
+- 오브젝트 스토어에 **Apache Parquet 데이터셋** 을 생성. **배치 잡 성능이 아주 좋아졌고**,
+  실행 시간이 줄어든 만큼 **클라우드 청구서도 감소**.
+- 그 결과 회사가 **데이터 웨어하우스 계층 생성** 을 요청. 요구사항 중 하나가 **이 Parquet 데이터셋을 데이터 분석가 팀에 노출** 하는 것.
+- 그런데 **첫 테스트에서 실행 시간이 배치 잡 프로듀서만큼 좋지 않았음**.
+- 원인 파악 결과, **가장 느린 연산은 오브젝트 스토어에서 로드할 파일을 리스팅하는 것**.
+- **결정적 제약**: 이 **비싼 리스팅 단계 자체를 피해야** 함.
+
+#### 해결 (Solution)
+
+리스팅이 반복되는 문제를 넘어서려면 **파일을 한 번만 리스팅** 하거나,
+**프로듀서가 파일명을 미리 기록할 수 있다면 아예 리스팅하지 않는 것** 이 낫다는 것이 Manifest 패턴의 전제.
+
+- **테이블 파일 포맷이 이 패턴의 첫 구현** — Delta Lake · Apache Iceberg · Apache Hudi.
+  - 해당 **트랜잭션 안에서 생성된 파일 목록** 을 **메타데이터 위치에 저장되는 커밋 로그** 에 씀.
+  - 리더는 데이터 파일에 접근할 때 **하부 스토리지를 전혀 리스팅하지 않고 커밋 파일에서 목록을 그대로 가져옴**.
+  - 이 맥락에서 **커밋 로그 파일이 매니페스트 파일 역할** — 즉 **데이터에 관한 필요·중요 정보를 모두 제공하는 파일**.
+- **자동 관리 매니페스트의 대안 = 수동 생성 매니페스트**
+  - 사전 리스팅 연산이 필요할 수 있음.
+  - **여러 리더가 같은 데이터셋 위에서 동작할 때 특히 유용** — 예를 들어 **챕터 6 의 Fan-Out 패턴** 의 일부로.
+- **읽기뿐 아니라 쓰기에서도 핵심 역할**
+  - **Amazon Redshift** 는 테이블에 새 데이터를 적재하는 **`COPY` 명령에 매니페스트 파일** 을 사용.
+    **적재 연산마다 서로 다른 매니페스트 파일**(전용 파일 목록)을 정의 가능.
+  - 이 구체화는 **챕터 4 의 멱등 파이프라인 구현에 엄청나게 유용** — 재실행이 항상 같은 파일 집합을 대상으로 하게 됨.
+  - **GCP 의 Storage Transfer Service** 에도 유사 구현 — **매니페스트 리스팅** 에 기반해 다른 클라우드 스토어에서 GCS 로 파일 복사.
+
+```
+[리스팅 vs 매니페스트 — 오브젝트 스토어 접근 경로]
+──────────────────────────────────────────────────────────────────────
+ ✗ 리스팅 (매 조회마다)
+   리더 ──LIST─► s3://visits/2024/05/05/  ─► 1,000 파일 (LIST API 여러 번)
+        ──LIST─► s3://visits/2024/05/06/  ─► 1,000 파일
+        ──LIST─► ...                          ⇒ 리더 수 × 파티션 수 만큼 API 호출
+        ⚠ 리더가 3개면 같은 리스팅을 3번 반복 · 오브젝트 스토어에서 느리고 예측 불가
+
+ ✓ 매니페스트 (프로듀서가 1회 기록)
+   프로듀서 ──write──► 데이터 파일 + _delta_log/000...json (파일 목록)
+   리더1 ──read──► 커밋 로그 ─► 파일 목록 확보 (LIST 0회)
+   리더2 ──read──► 커밋 로그 ─► 파일 목록 확보 (LIST 0회)
+   리더3 ──read──► 커밋 로그 ─► 파일 목록 확보 (LIST 0회)
+──────────────────────────────────────────────────────────────────────
+ ⇒ 리스팅 비용을 "리더 수 × 조회 횟수" 에서 "프로듀서 1회" 로 옮기는 거래.
+ ⚠ 대신 그 목록 파일 자체가 커진다는 새 문제가 생김 (아래 Size 참고).
+```
+
+#### 고려사항 (Consequences)
+
+패턴은 **효율과 최적화** 를 주지만, **복잡도와 전체 크기** 에서 트레이드오프가 있음.
+
+- **Complexity (복잡도)**
+  - **매니페스트 생성 단계를 추가** 해야 한다면 실행 흐름에 **추가 복잡도** 가 붙음.
+  - 다만 매니페스트 생성은 **최근에 쓴 파일들을 리스팅하는 정도의 단순한 연산**.
+  - **느리고 예측 불가한 리스팅을 여러 번 실행하는 것보다는**, 파이프라인에 이 정도 복잡도를 두는 편이 **받아들이기 쉬움**.
+- **Size (크기)**
+  - **매니페스트는 정말 크게 자랄 수 있음**. 특히 **입력 위치에 작은 파일이 많거나**,
+    **프로듀서가 연속 스트리밍 잡** 일 때 두드러짐. 이 경우 **수 GB 짜리 매니페스트** 도 흔히 보임.
+  - 일부 구현은 **매니페스트 파일의 최대 크기 제한** 이나 **파일 내 엔트리의 리텐션 설정** 을 둠.
+  - **실제 사례** — Apache Spark Structured Streaming 초기에는 파일을 쓸 때
+    출력 위치에 새 파일을 만드는 것에 더해 **그 이름을 매니페스트 파일에 계속 추가** 했음.
+    시간이 지나며 매니페스트가 **끝없이 커졌고**, 때로는 **매니페스트가 너무 커서 잡이 재시작조차 못 하는** 상황까지 발생.
+    이후 수정됨 (**SPARK-27188**).
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Delta Lake 매니페스트 생성 (Example 8-20)**
+
+서로 다른 두 기술을 함께 동작하게 만드는 예. 목표는 **Delta Lake 데이터셋을 BigQuery 의 외부 테이블(external table)로 노출**.
+먼저 Delta Lake 에서 매니페스트 파일을 생성 — `generate` 함수 호출이면 끝:
+```python
+devices_table = DeltaTable.forPath(spark_session, DemoConfiguration.DEVICES_TABLE)
+devices_table.generate('symlink_format_manifest')   # 최신 스냅샷의 파일 목록을 매니페스트로 기록
+```
+
+> 생성된 매니페스트는 **Delta Lake 테이블의 가장 최근 버전(= 스냅샷)이 사용하는 모든 파일** 을 담음.
+
+**예시 2 — 매니페스트로 외부 테이블 생성 (Example 8-21)**
+
+다음 할 일은 이 파일을 **외부 테이블 생성문에서 참조** 하는 것:
+```sql
+CREATE EXTERNAL TABLE IF NOT EXISTS `dedp.visits.devices`
+...
+OPTIONS (
+    hive_partition_uri_prefix = "gc://devices",
+    uris = ['gc://devices/_symlink_format_manifest/*/manifest'],  -- 리스팅 대신 매니페스트를 참조
+    file_set_spec_type = 'NEW_LINE_DELIMITED_MANIFEST',
+    format="PARQUET");
+```
+
+**예시 3 — Redshift `COPY` 의 멱등성 확보 (Example 8-22)**
+
+Redshift 는 **적재할 파일 목록** 으로 `COPY` 명령의 **멱등성을 강제** 할 수 있음.
+파일을 적재하기 전에 매니페스트를 만들어 **잡 실행에 연결해 두면**, **재실행(replay)에서도 같은 매니페스트를 그대로 사용** 가능.
+아래는 **필수 데이터 파일 두 개** 로 구성된 매니페스트를 쓰는 예:
+```sql
+COPY customer
+FROM 's3://devices/manifest_20250601_1031'
+...
+MANIFEST;
+```
+```json
+# manifest_20250601_1031
+{"entries": [
+ {"url":"s3://devices/dataset_1","mandatory":true},
+ {"url":"s3://devices/dataset_2","mandatory":true}]}
+```
+
+| 구현 | 매니페스트 위치 | 생성 주체 | 주된 용도 |
+|---|---|---|---|
+| **Delta Lake / Iceberg / Hudi** | 커밋 로그 (메타데이터 위치) | 프레임워크가 트랜잭션마다 자동 | 리더의 리스팅 제거 |
+| **Delta Lake `symlink_format_manifest`** | `_symlink_format_manifest/` | `generate()` 수동 호출 | 외부 엔진(BigQuery 등)에 노출 |
+| **Amazon Redshift `COPY ... MANIFEST`** | S3 상의 매니페스트 JSON | 파이프라인이 적재 전 생성 | 적재 멱등성(챕터 4) |
+| **GCP Storage Transfer Service** | 매니페스트 리스팅 파일 | 사용자 정의 | 클라우드 간 파일 복사 대상 고정 |
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — `symlink_format_manifest` 를 한 번 생성해 두고 재생성을 안 하면 외부 테이블이 조용히 옛 스냅샷을 읽음.</summary>
+<div markdown="1">
+
+**예 —** Delta 테이블에 `generate('symlink_format_manifest')` 를 최초 1회만 돌리고 BigQuery 외부 테이블을 만든 뒤,
+이후 배치가 `MERGE` 로 테이블을 갱신하고 `VACUUM` 까지 돌림.
+BigQuery 쪽은 **옛 매니페스트에 적힌 파일 경로** 를 그대로 읽어
+어제까지는 **3일 전 숫자** 를 리턴하다가, VACUUM 이 그 파일을 지운 순간
+`Not found: Files /gs://devices/part-...snappy.parquet` 로 쿼리가 통째로 실패함.
+
+**권장 —** 매니페스트 생성을 **쓰기 잡의 마지막 단계로 파이프라인에 고정** 할 것.
+`VACUUM` 의 보존 기간을 매니페스트 갱신 주기보다 **충분히 길게** 잡는 것도 함께 필요.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 스트리밍 잡에서 매니페스트·커밋 로그를 방치하면 잡이 재시작조차 못 하는 상태가 됨.</summary>
+<div markdown="1">
+
+**예 —** 1분 트리거 스트리밍 잡이 마이크로배치마다 파일 200개를 쓰면 **하루 288,000 엔트리** 가 매니페스트에 쌓임.
+몇 달이 지나 매니페스트가 수 GB 가 되면, 재시작 시 이 목록을 복원하는 단계에서 드라이버가
+`java.lang.OutOfMemoryError: GC overhead limit exceeded` 로 죽어 **잡을 아예 올리지 못하는 상태** 가 됨
+(Spark Structured Streaming 초기의 실제 이슈, SPARK-27188).
+
+**권장 —** 스트리밍 출력에는 **작은 파일을 줄이는 Compactor(챕터 2)** 를 함께 걸고,
+사용하는 구현의 **매니페스트 리텐션·최대 크기 설정을 명시적으로 확인** 할 것
+(Delta 라면 체크포인트 주기와 로그 리텐션 설정).
+
+</div>
+</details>
+
+---
+
+## 4. 데이터 표현 (Data Representation)
+
+데이터 스토리지는 **저장 구조 조직화(8.1·8.2)** 와 **조회 성능 최적화(8.3)** 만의 이야기가 아님.
+둘 다 데이터셋을 쓸모 있게 만드는 데 결정적이지만, **한 조각이 빠져 있음** — **데이터 표현(data representation)**.
+
+이는 결정적인 질문에 답함 — **"어떤 속성들을 함께 저장할 것인가, 따라서 어떤 테이블을 만들 것인가?"**
+
+- **#57 Normalizer** — **정보를 한 번만 표현** 해 **정합성** 을 우선 (아래 4-1 절).
+- **#58 Denormalizer** — **JOIN 을 줄이거나 없애** **실행 시간** 을 우선 (본 문서 범위 밖).
+
+---
+
+### 4-1. 패턴 #57: 정규화기 (Normalizer)
+
+> 첫 번째 데이터 표현 패턴은 **디커플링(decoupling)** 을 선호.
+> 이는 **정보를 중복 저장하지 않음으로써 데이터셋을 정합하게 유지** 하는 데 훌륭함.
+
+#### 상황 (Problem)
+
+**책의 use case** — visits 테이블의 불변 속성 반복:
+
+- Figure 1-1 의 **방문 이벤트(visit events)** 에 대한 데이터 모델을 정의했음.
+- 동료가 **데이터 중복** 을 지적. 실제로 `visits` 테이블은 **이벤트 기반 속성**(방문 시각, 방문 페이지)뿐 아니라
+  **불변 속성**(디바이스 이름, 운영체제 이름·버전)까지 저장 중.
+- **불변 속성이 방문 row 마다 반복** 되어 **저장 공간 증가** 와, 이 속성들이 바뀔 때의 **느린 갱신 연산** 을 유발.
+- **결정적 제약**: 설계를 재검토해 **데이터 반복과 느린 갱신** 문제를 해결하는 모델을 제안해야 함.
+
+#### 해결 (Solution)
+
+이 문제의 맥락에서 **분리(separation)** 는 **정규화(normalization)** 로 이해할 수 있음 —
+**각 정보 조각을 단 한 번만 표현** 해 반복을 줄이려는 것. 여기서 **Normalizer** 라는 이름이 나옴.
+
+Normalizer 에는 두 구현이 있음 — **정규형(normal forms, NF)** 과 **스노우플레이크 스키마(snowflake schema)**.
+이름과 기술적 세부는 달라도, 둘은 **같은 상위 설계 프로세스** 를 공유.
+
+- **① 비즈니스 엔티티 정의** — 데이터 모델에 관련된 용어 목록을 먼저 세움.
+  웹사이트 방문 예에서는 **visits · devices · browsers · link referrals** 등.
+- **② 비즈니스 엔티티 기술** — 각 엔티티의 **속성** 을 정의.
+  예를 들어 기술 대상이 **browser** 라면 속성은 **브라우저 이름과 버전**.
+- **③ 엔티티 간 관계 정의** — 비즈니스 엔티티 사이의 **의존성** 을 정의.
+  예를 들어 **visit 은 browser 의 가용성에 의존** 하고, **browser 는 operating system 의 가용성에 의존**.
+
+**구현 1 — 정규형(NF) 기반**
+
+**빠른 속도로 쓰기가 일어나는 트랜잭션 워크로드** 에 널리 쓰임.
+NF 설계는 **중복을 줄여 데이터 품질 이슈를 제거** 하고, 결과적으로 **쓸 데이터 볼륨도 줄임**.
+
+- **제1정규형(1NF)** — 테이블 컬럼은 **반복되지 않는 원자값(atomic value)** 을 가져야 하고,
+  각 row 는 **기본 키로 고유하게 식별** 가능해야 함.
+- **제2정규형(2NF)** — 각 컬럼은 **기본 키에만 의존** 해야 함.
+  달리 말해 **비기본키 속성은 모든 기본 키 속성에 의해 기술** 되어야 함.
+- **제3정규형(3NF)** — **비기본 속성들 사이에 이행적 종속(transitive dependency)이 없음** 을 보장.
+  달리 말해 **모든 비기본 컬럼은 기본 키에만 의존** 해야 함.
+
+> **참고 사항 — 더 많은 정규형 (More Normal Forms)**
+> 정규형은 더 있지만, 방금 설명한 **세 가지가 가장 흔히 쓰임**.
+> 이 셋을 아는 것으로 **Normalizer 패턴을 구현하기에 충분**.
+
+각 정규형이 **깨진** 버전을 보면 이해가 쉬움.
+
+```
+[Table 8-1] 제1정규형이 깨진 예 — comments 에 반복 속성
+──────────────────────────────────────────────────────────────────────
+ Name (primary key) | Comments
+ -------------------+------------------
+ Puzzle Tour        | ["...", "..."]     ← 원자값이 아님 (배열)
+ Runner             | ["..."]
+──────────────────────────────────────────────────────────────────────
+ ✗ comments 컬럼이 반복 속성을 담고 있음.
+ ✓ 정규화 — 각 comment 를 전용 games_comments 테이블로 추출.
+```
+
+```
+[Table 8-2] 제2정규형이 깨진 예 — 복합 기본 키의 일부에만 의존
+──────────────────────────────────────────────────────────────────────
+ Name (PK)   | Platform (PK) | Release year | Platform language
+ ------------+---------------+--------------+------------------
+ Puzzle Tour | iOS           | 2023         | Swift
+ Puzzle Tour | Android       | 2024         | Kotlin
+ Runner      | Android       | 2024         | Kotlin
+──────────────────────────────────────────────────────────────────────
+ PK = (Name, Platform). 2NF 상 나머지 컬럼은 두 키 컬럼 모두에 완전히 의존해야 함.
+ ✗ Platform language 는 Platform 에만 의존 (Name 과 무관).
+ ✓ 정규화 — platform 과 platform language 를 담는 새 테이블 생성.
+```
+
+```
+[Table 8-3] 제3정규형이 깨진 예 — 이행적 종속
+──────────────────────────────────────────────────────────────────────
+ Name (PK)   | Studio   | Studio country
+ ------------+----------+---------------
+ Puzzle Tour | Studio A | Italy
+ Runner      | Studio B | Portugal
+──────────────────────────────────────────────────────────────────────
+ ✗ Studio country 는 게임 이름이 아니라 studio 이름에 의존 (Name → Studio → Country).
+ ✓ 정규화 — 새 studios 테이블을 만들어 관련 정보를 모두 그 안에 넣음.
+```
+
+**구현 2 — 스노우플레이크 모델(차원 모델 변형)**
+
+NF 모델은 Normalizer 의 **첫 구현**. 관계형 DB 의 트랜잭션 워크로드에 자주 쓰이지만,
+**분석 워크로드에 존재하는 차원 모델(dimensional model) 변형** 도 있음.
+
+- **차원 모델** — **fact table 하나 + dimension table 여럿** 으로 구성된 설계.
+  - **fact table** — **관찰(observation)** 을 표현. 예: 이커머스 주문, 웹사이트 방문.
+  - **dimension table** — 그 관찰을 **추가 컨텍스트로 기술**. 예: 주문의 상품 정보, 방문의 브라우저 구성.
+  - (더 알고 싶다면 Kimball & Ross, *The Data Warehouse Toolkit*, 3rd ed. 참고)
+- **스노우플레이크 모델** — 차원 모델 중 하나이자 **Normalizer 의 또 다른 구현**.
+  **fact table 을 여러 dimension table 이 기술** 하고, **그 dimension 을 다시 다른 dimension table 이 기술** 함.
+  - 예를 들어 **date 같은 dimension 을 quarters·months 같은 서브디멘션으로 정규화** 가능.
+  - 스노우플레이크 모델은 **여러 번 반복되는 속성을 전용 서브디멘션 테이블로 옮기는 경향**.
+
+```
+[Figure 8-8 재현] 스노우플레이크 모델 — dimension 을 다른 dimension 이 기술
+──────────────────────────────────────────────────────────────────────
+    ┌─────────────┐                        ┌─────────────┐
+    │  Dimension  │                        │  Dimension  │
+    └──────▲──────┘                        └──────▲──────┘
+           │                                      │
+           │        ┌──────────────┐              │
+           ├════════┤     Fact     ├══════════════┤
+           │        └──────────────┘              │
+           ▼                                      ▼
+    ┌─────────────┐                        ┌─────────────┐
+    │  Dimension  │                        │  Dimension  │
+    └──────┬──────┘                        └──────┬──────┘
+           ▼                                      ▼
+    ┌─────────────┐                        ┌─────────────┐
+    │Subdimension │                        │Subdimension │
+    └──────┬──────┘                        └─────────────┘
+           ▼
+    ┌─────────────┐
+    │Subdimension │
+    └─────────────┘
+──────────────────────────────────────────────────────────────────────
+ 중앙 fact table 을 dimension 이 감싸고, dimension 을 다시 subdimension 이 감쌈.
+ 예 — dim_date ─► dim_month ─► dim_quarter 처럼 반복 속성을 계속 아래로 밀어냄.
+ ⇒ 중복은 최소화되지만, 전체 그림을 얻으려면 JOIN 이 그만큼 늘어남.
+```
+
+**핵심 목표** — NF 와 스노우플레이크 모델 양쪽에서 보이듯,
+Normalizer 패턴의 **가장 중요한 목표는 어떤 성능 최적화보다 데이터 정합성을 우선** 하는 것.
+이는 **갱신이 쉬워진다** 는 뜻 — **어떤 갱신이든 관련된 모든 테이블에 즉시 반영** 됨.
+
+```
+[정규화 전후 — 불변 속성이 반복되는 문제]
+──────────────────────────────────────────────────────────────────────
+ ✗ 정규화 전 — visits 한 테이블
+   visit_id | event_time | page  | device_type | device_version | os_name
+   v1       | 10:00      | /home | mac         | Yoga 7i        | Android 10
+   v2       | 10:01      | /cart | mac         | Yoga 7i        | Android 10
+   v3       | 10:02      | /pay  | mac         | Yoga 7i        | Android 10
+   ⇒ 불변 속성이 방문마다 반복 · 디바이스 이름 하나 고치려면 수억 row UPDATE
+
+ ✓ 정규화 후 — 엔티티 분리
+   visits            devices
+   visit_id|dev_id   id |type|version
+   v1      | d1      d1 |mac |Yoga 7i     ← 정보를 단 한 번만 저장
+   v2      | d1
+   v3      | d1
+   ⇒ 디바이스 정보 수정 = devices 1 row UPDATE, 모든 방문에 즉시 반영
+   ⚠ 대신 방문의 전체 그림을 보려면 JOIN 필요
+──────────────────────────────────────────────────────────────────────
+```
+
+#### 고려사항 (Consequences)
+
+여기서 가장 큰 단점은 **복잡도**. 하지만 그것이 **데이터를 정합하게 유지하려면 치러야 할 값**.
+
+- **Query cost (쿼리 비용)**
+  - Normalizer 는 **데이터가 여러 곳으로 나뉘는 것을 선호** ⇒ 조회 시 **`JOIN` 에 자주 의존**.
+  - **분산 환경에서 조인은 네트워크를 통한 데이터 교환을 수반** 하므로 비쌈.
+  - **완화책 1 — 코로케이션(colocating)**: 작은 dimension·entity 테이블을 큰 테이블과 함께 배치해
+    **조인이 노드 로컬에서 끝나게** 함.
+  - **완화책 2 — broadcast 모드**: 작은 테이블을 **모든 컴퓨트 노드에 전송** 해,
+    보통 더 비싼 다른 데이터 분산 방식을 피함.
+- **Archival (아카이빙)**
+  - **dimension·entity 테이블이 시간에 민감할 수 있음**.
+    예를 들어 `product` 테이블은 **연도마다 다른 가격** 을 가질 수 있고,
+    쿼리 계층에서 **특정 날짜의 가격이 얼마였는지** 알고 싶을 수 있음.
+  - **완화책** — **챕터 5 Static Joiner 패턴** 에서 소개한 **SCD(Slowly Changing Dimension) 기법** 으로 쉽게 해결.
+
+> **참고 사항 — 큰 테이블 브로드캐스트하기 (Broadcasting Big Tables)**
+> 큰 테이블을 브로드캐스트하는 가장 쉬운 접근은 **필터를 적용해 크기를 줄이는 것**.
+> 그게 불가능하다면 **더 큰 테이블도 브로드캐스트하도록 처리 계층을 설정** 해 볼 수 있음.
+> Apache Spark 에서는 `spark.sql.autoBroadcastJoinThreshold` 프로퍼티로 이 부분을 제어.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — 방문 이벤트의 정규형 모델 (Figure 8-9)**
+
+use case 데이터셋의 방문 이벤트를 정규형으로 테이블화하면 **만들어야 할 테이블이 상당히 많아짐**:
+
+```
+[Figure 8-9 재현] 정규형으로 표현한 visits
+──────────────────────────────────────────────────────────────────────
+ ┌──────────────┐         ┌──────────────────────┐         ┌────────────┐
+ │    Visits    │         │   Visits_contexts    │     ┌──►│    Ads     │
+ ├──────────────┤         ├──────────────────────┤     │   ├────────────┤
+ │ visit_id     ├────────►│ visit_id             │     │   │ id         │
+ │ pages_id     │         │ ads_id               ├─────┤   │ name       │
+ │ user_id      │         │ browsers_id          ├─────┤   └────────────┘
+ │ event_time   │         │ devices_id           ├─────┤   ┌────────────┐
+ └───┬──────┬───┘         │ referral             │     ├──►│  Browsers  │
+     │      │             │ user_ip              │     │   ├────────────┤
+     │      │             │ user_connected_since │     │   │ id         │
+     │      │             └──────────────────────┘     │   │ name       │
+     │      │                                          │   │ version    │
+     │      │   ┌────────────┐                         │   └────────────┘
+     │      └──►│   Users    │                         │   ┌────────────┐
+     │          ├────────────┤                         └──►│  Devices   │
+     │          │ id         │                             ├────────────┤
+     │          │ login      │                             │ id         │
+     │          └────────────┘                             │ type       │
+     │                                                     │ version    │
+     │                                                     └────────────┘
+     │
+     │          ┌────────────────────┐        ┌─────────────────┐
+     └─────────►│       Pages        ├───────►│ Page_categories │
+                ├────────────────────┤        ├─────────────────┤
+                │ id                 │        │ id              │
+                │ page_categories_id │        │ name            │
+                │ name               │        │ url             │
+                │ url                │        └─────────────────┘
+                └────────────────────┘
+──────────────────────────────────────────────────────────────────────
+ visit 의 기본 키 = (visit_id, pages_id, user_id, event_time).
+ ① browsers·devices 속성은 전용 테이블에 있음 — 브라우저·디바이스는 visit 에 의존하지 않는
+    별개 엔티티이고 여러 visit 이 공유하므로 visits_context 의 일부가 될 수 없음.
+ ② visits_contexts 의 레코드를 visits 에 넣지 않은 이유 — 넣으면 반복 그룹이 생겨 1NF 를 깸.
+ ⇒ 방문 하나의 전체 그림을 보려면 위 화살표를 전부 따라가야 함 = 조인 6회 (Example 8-23).
+```
+
+**예시 2 — 정규화된 데이터셋 조인 (Example 8-23)**
+
+다이어그램에서 보이듯, **방문의 전체 그림을 얻으려면 쿼리가 장황해짐**.
+Apache Spark + Delta Lake 에서의 오버헤드:
+```python
+context = (visits_context
+ .join(ads, visits_context.ads_id == ads.id, 'left_outer').drop('id')
+ .join(browser, visits_context.browsers_id == browser.id, 'left_outer').drop('id')
+ .join(device, visits_context.devices_id == device.id, 'left_outer').drop('id'))
+
+page_with_category = (pages.withColumnRenamed('id', 'page_id')
+  .join(categories, pages.page_categories_id == categories.id, 'left_outer')
+   .drop('id').withColumnRenamed('page_id', 'id'))
+
+full_visit = (visits
+ .join(context, visits.visit_id_event == context.visit_id, 'left_outer')
+ .drop('visit_id_event')
+ .join(users, visits.users_id == users.id, 'left_outer').drop('id')
+ .join(page_with_category, visits.pages_id == page_with_category.id, 'left_outer')
+ .drop('id').withColumnRenamed('visit_id', 'id')
+)   # visit 하나의 전체 그림을 얻는 데 조인 6회
+```
+
+> 여기서 알 수 있는 것 — **완전히 정규화된 데이터셋은 조회가 쉽지 않고**,
+> **조인 횟수 때문에 큰 데이터셋에서 성능이 잘 안 나올 수 있음**.
+
+**예시 3 — 스노우플레이크 스키마에서도 마찬가지 (Example 8-24)**
+
+visits use case 로 스노우플레이크 모델을 설계해도 **같은 문제** 를 만남.
+전체 그림을 얻으려면 여전히 조인이 많이 필요 — 아래는 **날짜와 페이지를 결합** 하는 부분:
+```python
+page_w_category = dim_page.join(dim_page_category,
+ dim_page.dim_page_category_id == dim_page_category.page_category_id,
+ 'left_outer')
+date_with_month_and_quarter = (dim_date
+ .join(dim_date_month, dim_date.dim_month_id == dim_date_month.month_id,
+  'left_outer')                                        # dimension 을 subdimension 이 기술
+ .join(dim_date_quarter, dim_date.dim_quarter_id == dim_date_quarter.quarter_id,
+  'left_outer'))
+
+full_visit = (fact_visit
+ .join(page_w_category, fact_visit.dim_page_id == page_w_category.page_id,
+  'left_outer')
+ .join(date_with_month_and_quarter
+  fact_visit.dim_date_id == date_with_month_and_quarter.date_id,
+  'left_outer')
+)
+```
+
+| 구현 | 주 워크로드 | 최적화 대상 | 대가 |
+|---|---|---|---|
+| **정규형(1NF·2NF·3NF)** | 트랜잭션 (쓰기 빈번) | 중복 제거 · 쓰기 볼륨 감소 · 데이터 품질 | 조회 시 조인 다수 |
+| **스노우플레이크 모델** | 분석 (차원 모델) | 반복 속성을 서브디멘션으로 분리 | dimension 계층만큼 조인이 더 늘어남 |
+| **(비교) #58 Denormalizer** | 분석 (조회 빈번) | 조인 제거 · 실행 시간 | row 정합성 · 저장 공간 |
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 분석 계층까지 3NF 로 밀어붙이면 조인 폭발로 대시보드가 사실상 못 쓰게 됨.</summary>
+<div markdown="1">
+
+**예 —** OLTP 습관대로 웨어하우스도 3NF 로 설계해, 방문 1건의 전체 그림을 보는 데 **테이블 8개 조인** 이 필요해짐.
+`fact_visit` 5억 row 와 dimension 들을 조인하면 Spark 가 **shuffle 단계에서만 200GB** 를 교환하고,
+`spark.sql.autoBroadcastJoinThreshold` 기본값 10MB 를 넘는 dimension 들은 전부
+broadcast 대신 **SortMergeJoin** 으로 떨어져 대시보드 쿼리가 4분을 넘김.
+
+**반대 함정 —** 그렇다고 처음부터 전부 비정규화하면, 디바이스 모델명 오타 하나 고치는 데
+**수억 row `UPDATE`** 가 필요해지고 갱신 도중 조회는 정합성이 깨진 값을 보게 됨.
+
+**권장 —** **정합성이 필요한 원천은 정규형으로 유지** 하고, 조회용은 그 위에 **#55 Dataset Materializer**
+또는 **#58 Denormalizer** 로 별도 계층을 만들 것. 두 패턴은 배타적이지 않음.
+작은 dimension 은 **broadcast 대상이 되도록 크기를 관리** 하는 것도 함께 챙길 것.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — dimension 테이블을 덮어쓰기(overwrite)로 갱신하면 과거 시점 재계산이 영영 불가능해짐.</summary>
+<div markdown="1">
+
+**예 —** `dim_product` 를 매일 전체 덮어쓰기로 동기화해 왔는데,
+"작년 블랙프라이데이 매출을 당시 가격 기준으로 다시 뽑아 달라" 는 요청이 들어옴.
+`fact_order` 에는 `product_id` 만 있고 가격은 dimension 쪽에 있어서,
+**모든 과거 주문이 오늘 가격으로 계산** 됨 — 매출이 실제와 수억 원 단위로 어긋남.
+
+**권장 —** 시간에 민감한 dimension 은 **덮어쓰기 대신 SCD Type 2**(`valid_from`/`valid_to` 컬럼)로 이력을 남길 것.
+챕터 5 **Static Joiner** 에서 다룬 기법이 그대로 적용됨.
+
+</div>
+</details>
+
+---
+
+## 5. 요약
+
+챕터 8 은 **"데이터를 어떻게 배치해야 빠르고 싸게 읽히나"** 를 **나누기(파티셔닝)** → **묶고 정렬하기(레코드 조직화)**
+→ **읽을 때 덜 건드리기(조회 성능 최적화)** → **무엇을 같이 둘지 정하기(데이터 표현)** 네 단계로 다룸.
 
 - **파티셔닝** — 처리할 데이터 볼륨 자체를 줄이는 첫 단계.
   #50 **Horizontal Partitioner** 는 **row 전체** 를 파티션 값별 위치로 옮기며, **저카디널리티 값**(이벤트 시각 등)에 좋은 후보.
@@ -1096,6 +1977,12 @@ Z-order·클러스터링은 **주기적 최적화 잡으로 스케줄링** 해 �
 - **레코드 조직화** — 파티셔닝은 훌륭한 저장 최적화지만 **성(last name)·도시** 같은 **고카디널리티 값에는 안 통함**.
   이때 더 나은 접근이 #52 **Bucket** — 비슷한 row 여러 개를 **버킷** 이라는 컨테이너로 묶음.
   추가로 #53 **Sorter** 를 활용하면 **정렬된 데이터 위에서 더 빠른 처리** 가 가능.
+- **조회 성능 최적화** — 배치가 끝난 데이터를 **읽는 경로** 에서 더 줄이는 전략.
+  #54 **Metadata Enhancer** 는 **메타데이터 계층에서 무관한 파일·row 를 걸러** 처리할 볼륨을 줄임.
+  #55 **Dataset Materializer** 는 **복잡한 쿼리를 구체화** 해 **저장 공간을 내주고 읽기 경로를 최적화**.
+  #56 **Manifest** 는 **비싸기 일쑤인 리스팅 연산** 을 완화.
+- **데이터 표현** — #57 **Normalizer** 는 **데이터 정합성을 우선** 하되 **조인을 수반**.
+  대안인 #58 **Denormalizer** 는 **정합성 위험을 감수** 하는 대신 **여러 데이터셋을 조인할 필요를 완전히 없앰**.
 
 | 패턴 | 카테고리 | 한 줄 요약 | 핵심 트레이드오프 |
 |---|---|---|---|
@@ -1103,34 +1990,57 @@ Z-order·클러스터링은 **주기적 최적화 잡으로 스케줄링** 해 �
 | #51 Vertical Partitioner | Partitioning | 한 row 를 컬럼 그룹별 여러 파티션으로 분할 | 불변 속성 1회 저장·조각별 정책 / <br>도메인 분할·join 필요·프로듀서 부담 |
 | #52 Bucket | Records Organization | 고카디널리티 레코드를 `hash%N` 으로 묶어 배치 | 버킷 프루닝·shuffle 없는 join / <br>스키마 불변(backfill)·key 직접 접근 불리 |
 | #53 Sorter | Records Organization | 데이터 블록을 디스크에 정렬해 저장 | 데이터 스키핑으로 읽기↑ / <br>쓰기 정렬 오버헤드·복합 정렬 키 제약 |
+| #54 Metadata Enhancer | Read Performance | 메타데이터 계층을 활용해 처리 시간 최적화 | 파일·row 를 열기 전에 스킵 / <br>쓰기 시 통계 생성 오버헤드·낡은 통계 |
+| #55 Dataset Materializer | Read Performance | 복잡한 레이아웃을 테이블·뷰로 구체화 | 반복 계산 제거·단일 접근점 / <br>refresh 비용·접근 정책 관리·저장 공간 |
+| #56 Manifest | Read Performance | 리스팅 연산 자체를 회피 | 리더의 LIST API 호출 제거·적재 멱등성 / <br>생성 단계 복잡도·매니페스트 비대화 |
+| #57 Normalizer | Data Representation | 데이터 저장을 엔티티 단위로 격리 | 정보 1회 저장·즉시 반영되는 갱신 / <br>여러 테이블 조인 비용·아카이빙(SCD) 필요 |
 
 ```
-[챕터 8 전반부 선택 가이드 — #50~#53]
+[챕터 8 선택 가이드 — #50~#57]
 ──────────────────────────────────────────────────────────────────────
- 데이터를 나눌 때
+ ① 데이터를 나눌 때
    row 전체를 값별로 나눔 · 저카디널리티     ─► #50 Horizontal Partitioner (날짜·국가)
    row 를 컬럼 그룹으로 쪼갬 · 불변 속성     ─► #51 Vertical Partitioner (mutable ↔ immutable)
 
- 파티셔닝으로 안 될 때
+ ② 파티셔닝으로 안 될 때
    고카디널리티 컬럼이 술어에 자주 등장      ─► #52 Bucket (hash(key) % N)
    같은 컬럼으로 join 도 자주 함             ─► #52 Bucket (양쪽 동일 구성 → shuffle 제거)
 
- 블록 단위로 더 좁히고 싶을 때
+ ③ 블록 단위로 더 좁히고 싶을 때
    특정 컬럼으로 필터·정렬이 대부분          ─► #53 Sorter (CLUSTER BY, 사전식)
    여러 컬럼을 제각각 단독으로 필터          ─► #53 Sorter (Z-order, 곡선 정렬)
+
+ ④ 읽기 경로에서 더 줄이고 싶을 때
+   파일을 "열기 전에" 걸러 내고 싶음         ─► #54 Metadata Enhancer (footer min/max·nullCount)
+   같은 비싼 쿼리를 반복 실행 중             ─► #55 Dataset Materializer (MV / 테이블 + 증분 MERGE)
+   가장 느린 단계가 파일 리스팅              ─► #56 Manifest (커밋 로그·symlink manifest)
+
+ ⑤ 무엇을 같이 저장할지 정할 때
+   불변 속성 반복 · 갱신 정합성이 중요        ─► #57 Normalizer (NF / 스노우플레이크)
+   조인이 쿼리의 80% · 실행 시간이 중요       ─► #58 Denormalizer (본 문서 범위 밖)
 ──────────────────────────────────────────────────────────────────────
  ⚠ 파티션 키는 폭증(리스팅·small files)을, 버킷은 개수 고정(변경 시 backfill)을,
-   정렬은 선행 컬럼 의존과 정렬 안 된 세그먼트를 각각 조심할 것.
+   정렬은 선행 컬럼 의존과 정렬 안 된 세그먼트를, 통계는 낡음을,
+   구체화는 refresh 비용을, 매니페스트는 비대화를 각각 조심할 것.
 ```
 
-**정리** — 이 네 패턴은 **"위치를 나누고(#50·#51) → 그 안에서 그룹을 묶고(#52) → 블록을 정렬한다(#53)"** 는
-**점점 국소적으로 좁혀 가는 한 축**. 배타적 선택지가 아니라 **층층이 쌓아 쓰는 도구** 라는 점이 핵심.
+**정리 1 — 좁혀 가는 축** — #50~#54 는 **"위치를 나누고(#50·#51) → 그 안에서 그룹을 묶고(#52) →
+블록을 정렬하고(#53) → 그 블록을 열기 전에 통계로 거른다(#54)"** 는 **점점 국소적으로 좁혀 가는 한 축**.
+배타적 선택지가 아니라 **층층이 쌓아 쓰는 도구** 라는 점이 핵심 —
+특히 **#53 Sorter 없는 #54 Metadata Enhancer 는 효과가 거의 없음**(파일마다 min/max 구간이 전 범위를 덮으므로).
 
-한 줄로 관통하는 원칙은 **"쓰기에서의 수고를 읽기에서의 절감으로 바꾸는 거래"** —
+**정리 2 — 관통하는 원칙** — **"쓰기에서의 수고를 읽기에서의 절감으로 바꾸는 거래"**.
 #51 은 프로듀서에 분할 로직과 다중 write 를, #52 는 backfill 없이 못 바꾸는 스키마를,
-#53 은 쓰기 시점의 정렬 비용을 각각 요구하고, 그 대가로 컨슈머 (조회하는 쪽)의 스캔량을 줄여 줌.
+#53 은 쓰기 시점의 정렬 비용을, #54 는 통계 생성·갱신 비용을, #55 는 저장 공간과 refresh 를,
+#56 은 매니페스트 생성 단계를 각각 요구하고, 그 대가로 컨슈머 (조회하는 쪽)의 스캔량·대기 시간을 줄여 줌.
+
+**정리 3 — 8.4 는 성격이 다름** — #50~#56 이 **"같은 데이터를 어떻게 배치·접근할지"** 였다면,
+#57·#58 은 **"애초에 무엇을 한 테이블에 둘지"** 라는 **모델링 결정**.
+여기서의 축은 성능이 아니라 **정합성 ↔ 실행 시간** 이고, 둘은 배타적이지 않음 —
+**정규형으로 원천을 잡고, 그 위에 구체화(#55)나 비정규화(#58) 계층을 얹는 조합** 이 실무의 기본형.
 **어떤 축으로 얼마나 좁힐지는 실제 쿼리 술어 분포** 를 보고 정할 일.
 
-> 데이터를 잘 배치했더라도 **읽기 경로에는 아직 최적화 여지가 남음**.
-> 이어지는 절에서는 **메타데이터 계층 활용(#54 Metadata Enhancer)**, **비싼 연산의 1회 구체화(#55 Dataset Materializer)**,
-> **비싼 리스팅 회피(#56 Manifest)** 와 **데이터 표현 방식(#57 Normalizer / #58 Denormalizer)** 이 이어짐.
+> 저장을 아무리 잘 최적화해도 **다른 사람이 그 데이터를 쓰게 만들기엔 충분하지 않음**.
+> **가능한 최고 품질의 데이터** 를 함께 제공해야 하고, 그것이 **챕터 9 데이터 품질 디자인 패턴** 의 주제.
+> ※ 본 문서에서 다루지 않은 **#58 Denormalizer** — 조인이 쿼리의 80% 를 차지하던 회사 사례에서 출발해,
+> **One Big Table** 등으로 조인을 제거하는 대신 **row 정합성과 저장 공간** 을 내주는 패턴.
