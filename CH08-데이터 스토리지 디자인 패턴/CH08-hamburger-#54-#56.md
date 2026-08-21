@@ -364,3 +364,122 @@ full_visit = (fact_visit
     .join(page_w_category, fact_visit.dim_page_id == page_w_category.page_id, 'left_outer')
     .join(date_with_month_and_quarter))
 ```
+## **패턴 #58: 역정규화기**
+
+역정규화기 패턴은 쿼리에서 조인(Join) 연산을 줄이거나 완전히 제거하여 데이터 접근 및 조회 성능을 최적화하는 스토리지 패턴이다.
+
+### 1\. 문제 상황
+
+-   데이터 웨어하우스 스토리지 위에 관계형 데이터 모델을 구현하여 운영하였다.
+-   초기에는 데이터 볼륨이 적어 문제가 없었으나, 서비스가 크게 성장하면서 데이터 분석 부서로부터 쿼리 실행 시간이 너무 느리다는 불만이 발생하였다.
+-   분석 결과, 전체 쿼리의 80% 이상이 8개 이상의 테이블을 동시에 조인하고 있어 극심한 성능 저하와 비용 상승을 유발하고 있었다.
+
+### 2\. 해결책
+
+조인된 테이블의 모든 값들을 단일 레코드로 평면화(Flattening)하여, 네트워크를 통한 데이터 교환 과정 자체를 없앤다.
+
+#### 평면화의 두 가지 접근 방식
+
+-   **일반적인 컬럼 방식**: 조인 대상 테이블의 각 컬럼을 그대로 복사하여 저장한다. 사용자는 SELECT 문에서 최상위 컬럼으로 데이터에 직접 접근할 수 있다.
+-   **중첩 구조(STRUCT) 방식**: 조인된 테이블들의 레코드를 대상 테이블의 단일 컬럼 내 중첩 구조로 담아 저장한다. 사용자는 해당 컬럼의 내부 속성에 접근하여 조회한다.
+
+#### 역정규화의 주요 구현 형태
+
+-   **One Big Table (OBT)**: 방문(visit) 데이터와 사용자(users), 장치(devices) 등의 참조 데이터셋을 하나의 커다란 단일 테이블에 모아서 저장하는 방식이다.
+    -   **역정규화된 방문 테이블 예시**:
+
+| visit\_id | user\_id | user\_name | device\_id | device\_full\_name | visit\_time | visited\_page |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 409 | user ABC | 10000 | local computer | 2024-07-01T09:00:00Z | home.html |
+
+-   **스타 스키마 (Star Schema)**: 팩트(Fact) 테이블과 차원(Dimension) 테이블을 나누어 구성하지만, 스노우플레이크 스키마와 달리 계층적이거나 중첩된 차원을 허용하지 않는다. 모든 하위 차원 속성들을 최상위 차원 테이블에 통합하여 조인 수를 축소한다.
+
+#### 정규화기와 역정규화기의 결합
+
+-   두 패턴은 상호 배타적이지 않으며 조합하여 사용될 수 있다.
+-   원본 데이터는 일관성을 위해 **스노우플레이크 스키마** 형태로 정규화하여 관리하고, 이를 기반으로 읽기 전용 **One Big Table**을 별도로 구축하는 워크플로를 적용할 수 있다.
+-   이를 통해 분석가에게 스노우플레이크 스키마를 숨기고 읽기 최적화된 테이블만 제공하는 운용이 가능하다.
+
+### 3\. 결과 및 고려사항 (Trade-offs)
+
+역정규화는 빠른 데이터 접근을 제공하지만, 데이터 일관성을 희생한다.
+
+-   **고비용 갱신 (High Cost Update)**: 데이터가 여러 레코드에 중복으로 저장되므로, 단 1개의 속성이 변경되어도 복수의 레코드를 모두 업데이트해야 하여 쓰기/갱신 연산 비용이 정규화 구조보다 훨씬 비싸다.
+    -   **완화 전략**: 역정규화된 데이터를 특정 시점의 데이터 상태인 '스냅샷'으로 간주하여 재처리하면 갱신 연산 자체를 방지할 수 있다.
+-   **스토리지 오버헤드**: 동일한 데이터가 반복 저장되므로 데이터베이스 저장 공간을 크게 차지한다.
+    -   **완화 전략**: 긴 문자열을 정수형 값으로 매핑하는 **딕셔너리 인코딩(Dictionary Encoding)** 등 압축 인코딩 기법을 활용한다. 이는 용량 절감뿐만 아니라, 쿼리 엔진이 전체 데이터셋을 읽는 대신 딕셔너리 내 존재 여부만 검사하게 하여 조회 성능도 높인다.
+-   **하나의 큰 안티패턴 위험**: 도메인 지향 로직 없이 관련 없는 데이터(예: 방문 기록과 무관한 선호 색상, 과거 주문 목록 등)를 한 테이블에 무작위로 넣으면 테이블이 단순 '쓰레기통'으로 변질된다.
+    -   **주의 신호**: 테이블명 설정 시 and 또는 with와 같은 접속사가 다수 포함된다면 무분별한 역정규화가 이루어졌다는 신호이므로 경계해야 한다.
+
+### 4\. 예제 코드 (PySpark)
+
+#### (1) One Big Table (OBT) 쓰기 및 읽기
+
+생성 시점에는 복잡한 조인이 필요하여 쓰기 연산 비용이 높지만, 데이터 생성 후 조회가 매우 빠르고 비용이 적다.
+
+```
+# [쓰기] 여러 차원과 팩트를 조인하여 단일 OBT로 저장
+page_w_category = dim_page.join(
+    dim_page_category, 
+    dim_page.dim_page_category_id == dim_page_category.page_category_id, 
+    'left_outer'
+)
+
+date_w_month_quarter = (dim_date
+    .join(dim_date_month, dim_date.dim_month_id == dim_date_month.month_id, 'left_outer')
+    .join(dim_date_quarter, dim_date.dim_quarter_id == dim_date_quarter.quarter_id, 'left_outer')
+)
+
+full_visit = (fact_visit
+    .join(page_w_category, fact_visit.dim_page_id == page_w_category.page_id, 'left_outer')
+    .join(date_w_month_quarter, fact_visit.dim_date_id == date_w_month_quarter.date_id, 'left_outer')
+)
+
+full_visit.write.mode('overwrite').format('delta').save(get_one_big_table_dir())
+
+# [읽기] 조인 없이 단일 테이블 로드
+visits_table = spark_session.read.format('delta').load(get_one_big_table_dir())
+```
+
+#### (2) 스타 스키마 쓰기 및 읽기
+
+쓰기 단계에서 평면화된 차원 테이블과 팩트 테이블을 작성하고, 읽기 단계에서 필요한 최소한의 조인만 수행한다.
+
+```
+# [쓰기] 차원 및 팩트 테이블 생성 및 중복 제거 후 저장
+page_with_category = dim_page.join(
+    dim_page_category, 
+    dim_page.dim_page_category_id == dim_page_category.page_category_id, 
+    'left_outer'
+).dropDuplicates()
+page_with_category.write.mode('overwrite').format('delta').save(output_page)
+
+date_with_month_and_quarter = (dim_date
+    .join(dim_date_month, dim_date.dim_month_id == dim_date_month.month_id, 'left_outer')
+    .join(dim_date_quarter, dim_date.dim_quarter_id == dim_date_quarter.quarter_id, 'left_outer')
+).dropDuplicates()
+date_with_month_and_quarter.write.mode('overwrite').format('delta').save(output_date)
+
+visits_dataset = (spark_session.read
+    .schema('visit_id STRING, event_time TIMESTAMP, page STRING')
+    .format('json').load(input_visits_dir)
+)
+
+fact_visit = (visits_dataset.selectExpr(
+    'visit_id', 
+    'HASH(page) AS dim_page_id', 
+    'HASH(TO_DATE(event_time)) AS dim_date_id', 
+    "DATE_FORMAT(event_time, 'HH:mm:ss') AS event_time"
+))
+fact_visit.write.mode('overwrite').format('delta').save(output_visits_dir)
+
+# [읽기] 평면화된 차원 테이블들과 조인 수행
+fact_visit = spark_session.read.format('delta').load(output_visits_dir)
+dim_date = spark_session.read.format('delta').load(output_date)
+dim_page = spark_session.read.format('delta').load(output_page)
+
+full_visit = (fact_visit
+    .join(dim_date, fact_visit.dim_date_id == dim_date.date_id, 'left_outer')
+    .join(dim_page, fact_visit.dim_page_id == dim_page.page_id, 'left_outer')
+)
+```
