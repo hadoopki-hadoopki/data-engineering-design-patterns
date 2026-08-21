@@ -20,11 +20,12 @@
    - 패턴 #56: 매니페스트 (Manifest)
 4. [데이터 표현 (Data Representation)](#4-데이터-표현-data-representation)
    - 패턴 #57: 정규화기 (Normalizer)
+   - 패턴 #58: 역정규화기 (Denormalizer)
 5. [요약](#5-요약)
 
-> 본 문서는 챕터 8 의 **#50~#57** — **8.1 Partitioning · 8.2 Records Organization ·
-> 8.3 Read Performance Optimization · 8.4 Data Representation(전반)** — 을 다룸.
-> 마지막 패턴 **#58 Denormalizer** 는 별도로 정리.
+> 본 문서는 챕터 8 전체 — **#50~#58** — 를 다룸.
+> **8.1 Partitioning · 8.2 Records Organization ·
+> 8.3 Read Performance Optimization · 8.4 Data Representation**.
 > ※ **#51 Vertical Partitioner** 는 챕터 7 의 **#41 Vertical Partitioner** 와 이름이 같음.
 > **#41 은 보안 특화**(개인정보 삭제·잊힐 권리), **#51 은 스토리지 특화**(불변 속성 중복 저장 제거)로 목적이 다름.
 
@@ -53,7 +54,7 @@
 ──────────────────────────────────────────────────────────────────────
  흐름 — 먼저 나누고(8.1) → 저카디널리티로 안 되는 건 묶고·정렬하고(8.2)
         → 읽을 때 건드릴 것을 줄이고(8.3) → 표현 방식을 고름(8.4).
- ※ 본 문서는 8.1 · 8.2 · 8.3 · 8.4(#57) — 즉 #50~#57 을 다룸.
+ ※ 본 문서는 8.1 · 8.2 · 8.3 · 8.4 — 즉 #50~#58 전체를 다룸.
 ```
 
 **파티셔닝의 한계가 이 챕터의 이야기 축** — 파티셔닝은 **저카디널리티 값**(어떤 속성의 서로 다른 값이 많지 않을 때)에서만 잘 동작.
@@ -1664,7 +1665,7 @@ BigQuery 쪽은 **옛 매니페스트에 적힌 파일 경로** 를 그대로 �
 이는 결정적인 질문에 답함 — **"어떤 속성들을 함께 저장할 것인가, 따라서 어떤 테이블을 만들 것인가?"**
 
 - **#57 Normalizer** — **정보를 한 번만 표현** 해 **정합성** 을 우선 (아래 4-1 절).
-- **#58 Denormalizer** — **JOIN 을 줄이거나 없애** **실행 시간** 을 우선 (본 문서 범위 밖).
+- **#58 Denormalizer** — **JOIN 을 줄이거나 없애** **실행 시간** 을 우선 (아래 4-2 절).
 
 ---
 
@@ -2046,7 +2047,7 @@ full_visit = (fact_visit
 |---|---|---|---|
 | **정규형(1NF·2NF·3NF)** | 트랜잭션 (쓰기 빈번) | 중복 제거 · 쓰기 볼륨 감소 · 데이터 품질 | 조회 시 조인 다수 |
 | **스노우플레이크 모델** | 분석 (차원 모델) | 반복 속성을 서브디멘션으로 분리 | dimension 계층만큼 조인이 더 늘어남 |
-| **(비교) #58 Denormalizer** | 분석 (조회 빈번) | 조인 제거 · 실행 시간 | row 정합성 · 저장 공간 |
+| **(비교) #58 Denormalizer** | 분석 (조회 빈번) | 조인 제거 · 실행 시간 | row 정합성 · 저장 공간 (4-2 절) |
 
 <details>
 <summary><b>⚠ 트러블 로그</b> — 분석 계층까지 3NF 로 밀어붙이면 조인 폭발로 대시보드가 사실상 못 쓰게 됨.</summary>
@@ -2084,6 +2085,273 @@ broadcast 대신 **SortMergeJoin** 으로 떨어져 대시보드 쿼리가 4분�
 
 ---
 
+### 4-2. 패턴 #58: 역정규화기 (Denormalizer)
+
+> 두 번째 데이터 표현 패턴은 **결합(coupling)** 을 선호.
+> 조인이 비싸다는 것을 알면 단순한 최적화 기법 하나가 바로 떠오름 — **조인을 줄이거나 아예 없애는 것**.
+> 유감스럽게도 그 대가로 부작용이 따라옴.
+
+#### 상황 (Problem)
+
+**책의 use case** — 테이블 8개 조인이 쿼리의 80%:
+
+- 분석용 **데이터 웨어하우스 스토리지 위에 관계형 모델** 을 구현한 회사를 돕게 됨.
+- 처음 몇 달은 **데이터 볼륨이 낮아** 아무 이슈도 눈에 띄지 않았음.
+- 그런데 제품이 엄청나게 성공하면서 **데이터 분석 부서가 쿼리 실행 시간을 불평** 하기 시작.
+- 예비 분석 결과 — **가장 비싼 연산은 쿼리의 80% 에 관여하는 테이블 8개를 전부 조인** 하는 것.
+- **결정적 제약**: 컴퓨팅을 늘려도 조인이 수반하는 **네트워크 데이터 교환** 은 그대로.
+  모델 자체를 바꾸지 않으면 조인 비용이 계속 실행 시간을 지배함.
+
+#### 해결 (Solution)
+
+Normalizer 와 달리 Denormalizer 는 **쿼리에서 조인을 줄이고, 나아가 전부 제거** 하려 함.
+
+**제거(elimination) 접근** 의 핵심은 **평탄화(flattening)** —
+조인 대상 테이블들의 값을 **한 row 안으로 펼쳐 넣어**, **네트워크를 통해 데이터를 교환할 필요 자체를 없앰**.
+방법은 두 가지.
+
+- **① 일반 컬럼처럼 (just as regular columns)**
+  - 조인 대상 테이블의 **각 컬럼을 그대로 복사**.
+  - 사용자는 `SELECT` 에서 **최상위 컬럼으로 직접 접근**.
+  - 이 설계가 곧 **One Big Table**(Table 8-4).
+- **② 중첩 구조로 (as nested structures)**
+  - 조인 대상 테이블의 **모든 row 를 대상 테이블의 한 컬럼에 담음**.
+  - 보통 최신 데이터 스토어가 제공하는 **`STRUCT` 타입** 으로 복합 타입을 표현.
+  - 결과적으로 사용자는 컬럼을 직접 읽는 대신 **그 컬럼의 속성에 접근** 해야 함.
+
+```
+[Table 8-4] 역정규화된 visits 테이블 — One Big Table
+────────────────────────────────────────────────────────────────────────────────────────────
+ visit_id | user_id | user_name | device_id | device_full_name | visit_time           | visited_page
+ ---------+---------+-----------+-----------+------------------+----------------------+-------------
+ 1        | 409     | user ABC  | 10000     | local computer   | 2024-07-01T09:00:00Z | home.html
+────────────────────────────────────────────────────────────────────────────────────────────
+ users(user_name)·devices(device_full_name) 를 조인해서 얻던 값이 visits row 안에 그대로 들어와 있음.
+ ⇒ 이 row 를 읽는 데 필요한 조인 = 0회. 대신 user ABC 가 방문할 때마다 user_name 이 반복 저장됨.
+```
+
+**두 번째 구현 — star 스키마**
+
+두 번째 접근은 **관련 테이블들을 평탄화해 조인 횟수를 줄임**.
+차원 모델(dimensional model)의 **star 스키마** 가 전형적인 사용처.
+star 스키마도 fact·dimension 테이블을 쓰지만, **snowflake 와 달리 중첩 dimension 을 허용하지 않음**.
+달리 말해 **다른 dimension 을 기술하던 dimension 이 이제 최상위 dimension 테이블 안에 들어와 있음**.
+
+```
+[Figure 8-10 재현] dimension 계층이 한 단계뿐인 star 모델
+──────────────────────────────────────────────────────────────────────
+   ┌───────────────┐                       ┌───────────────┐
+   │   Dimension   │                       │   Dimension   │
+   └───────▲───────┘                       └───────▲───────┘
+           │                                       │
+           │           ┌────────────┐              │
+           ├───────────┤    Fact    ├──────────────┤
+           │           └────────────┘              │
+           │                                       │
+   ┌───────▼───────┐                       ┌───────▼───────┐
+   │   Dimension   │                       │   Dimension   │
+   └───────────────┘                       └───────────────┘
+──────────────────────────────────────────────────────────────────────
+ #57 의 snowflake 는 dim_date ─► dim_month ─► dim_quarter 처럼 dimension 이 dimension 을 기술해
+ 계층이 여러 단계였음. star 는 그 계층을 dimension 테이블 하나로 눌러 담음.
+ ⇒ fact 에서 dimension 까지 항상 조인 1회. 대신 month·quarter 값이 날짜 수만큼 반복 저장됨.
+```
+
+**Denormalizer 로 조인이 줄면 네트워크 트래픽이 줄고, 그만큼 쿼리 비용이 크게 낮아짐.**
+
+**Normalizer 와 Denormalizer 는 배타적이지 않음**
+
+정합성이 여전히 중요하다면 **Normalizer 모델을 먼저 적용하고, 그 위에 조회용 비정규화 버전을 만들면 됨**.
+둘을 동기화하는 데는 **챕터 6 의 시퀀스(sequence) 디자인 패턴** 을 활용할 수 있음.
+
+```
+[Figure 8-11 재현] Normalizer(snowflake 빌더) + Denormalizer(One Big Table 빌더) 조합
+──────────────────────────────────────────────────────────────────────────────────────
+   ┌─────────┐   ┌─────────┐   ┌─────────┐
+   │ Visits  │   │ Devices │   │  Users  │        원천 데이터셋
+   └────┬────┘   └────┬────┘   └────┬────┘
+        └─────────────┼─────────────┘
+                      ▼
+           ┌─────────────────────┐
+           │  Snowflake schema   │              ← #57 Normalizer
+           │       builder       │
+           └──────────┬──────────┘
+                      ▼
+           ┌─────────────────────┐              ┌─────────────────────┐
+           │   Website visits    │─────────────►│  One Big Table      │  ← #58 Denormalizer
+           │   snowflake schema  │              │       builder       │
+           └──────────┬──────────┘              └──────────┬──────────┘
+                      │                                    ▼
+                      │                         ┌─────────────────────┐
+                      │                         │   Website visits    │
+                      │                         │    with context     │
+                      │                         └──────────┬──────────┘
+                      │                                    │
+                      └──────────────┐      ┌──────────────┘
+                                     ▼      ▼
+                                ┌─────────────────┐
+                                │  Data analyst   │
+                                └─────────────────┘
+──────────────────────────────────────────────────────────────────────────────────────
+ 두 데이터셋 모두 사용자에게 열려 있음. 다만 snowflake 스키마를 **감추고**
+ 노출하는 테이블의 **비공개 참조 모델(private reference model)** 로만 취급하는 선택지도 있음.
+ ⇒ 정합성은 정규화 계층이, 실행 시간은 One Big Table 이 맡는 실무의 기본형.
+```
+
+#### 고려사항 (Consequences)
+
+Denormalizer 는 **데이터 접근을 최적화하는 대신 데이터 정합성을 희생**.
+
+- **Costly updates (비싼 갱신)**
+  - 이제 **모든 속성이 중복** 이므로, 하나를 갱신하려면 정규화 스토리지에서 row 한 건이면 될 일이
+    **여러 row 를 바꿔야 하는 일** 이 됨. 기술적으로 가능하지만 정규화 방식보다 비쌈.
+  - **마법 같은 완화책은 없음.** 유일하게 쓸 만한 완화 전략은
+    **비정규화 테이블을 무엇으로 볼 것인가** 를 정하는 것 —
+    **스냅샷**(특정 시점의 데이터 모습)으로 본다면 **갱신이 아예 필요 없음**.
+    그렇지 않다면 **더 빠른 응답을 얻는 대가로 더 비싼 갱신 연산을 받아들이는 것** 뿐.
+- **Storage (저장 공간)**
+  - 조인 대상 테이블의 **같은 정보를 여러 번 반복** 하게 되므로 저장 공간을 차지함.
+  - **완화책 — 인코딩**. 대표적으로 **딕셔너리(dictionary) 인코딩** 은
+    실제 값과 더 컴팩트한 표현 사이의 매핑을 만들고 컬럼에는 컴팩트한 값을 씀
+    (예: 긴 문자열 컬럼을 정수로 — `{1: "long name...", 2: "long name, next...", ...}`).
+  - 공간 절약뿐 아니라 **성능도 개선** — 쿼리 엔진이 어떤 값의 존재 여부를 확인할 때
+    데이터셋을 읽는 대신 **딕셔너리만 확인** 하고 끝낼 수 있음.
+- **One big antipattern (하나의 큰 안티패턴)**
+  - One Big Table 은 레코드를 평탄화해 쿼리 시간을 줄이려는 좋은 의도에도,
+    **도메인 지향 로직을 따르지 않으면 안티패턴으로 끝남**.
+  - 예 — 한 테이블에 **사용자 상세 · 과거 주문 목록 · 현재 방문 컬럼 · 좋아하는 색** 을 함께 묶음.
+    좋아하는 색과 과거 주문이 **방문(visit)과 아무 관계가 없다면**,
+    One Big Table 은 **밖에서 보면 안에 뭐가 들었는지 알 수 없는 쓰레기 봉투(trash bag)** 가 됨.
+  - **어디서 멈출지 판단하는 법** — 도메인 지식에 대한 직관이 답. 잘 모르겠다면
+    **테이블에 이름을 붙여 보는 연습** 을 할 것. `and`·`with` 같은 **접속사를 많이 쓰게 된다면**
+    **무관한 속성을 너무 많이 넣었다는 신호**.
+
+```
+[테이블 이름 붙이기 테스트] 어디까지 합칠 것인가
+──────────────────────────────────────────────────────────────────────
+ ✓ visits_with_context
+     → visit + page + category + device + browser + user
+       "방문 한 건의 맥락" 이라는 하나의 도메인으로 이름이 떨어짐.
+ ✗ users_with_orders_and_visits_and_preferences
+     → and 가 세 번. 서로 다른 도메인 세 개를 한 봉투에 넣었다는 신호.
+       ⇒ visits_with_context / user_orders / user_preferences 로 쪼갤 것.
+──────────────────────────────────────────────────────────────────────
+```
+
+#### 구현 예시 (Examples)
+
+**예시 1 — One Big Table 의 비싼 쓰기와 싼 읽기 (Example 8-25)**
+
+One Big Table 을 만드는 일 자체는 비쌀 수 있지만, **그 비용은 갱신 연산 1회당 한 번만 지불**.
+이후의 **모든 리더가 훨씬 빠른 연산의 혜택** 을 봄.
+
+```python
+# writing — 조인 비용을 "쓰는 쪽" 이 한 번에 몰아서 지불
+page_w_category = dim_page.join(dim_page_category,
+ dim_page.dim_page_category_id == dim_page_category.page_category_id,
+   'left_outer')
+date_w_month_quarter = (dim_date
+ .join(dim_date_month, dim_date.dim_month_id == dim_date_month.month_id,
+   'left_outer')
+ .join(dim_date_quarter, dim_date.dim_quarter_id == dim_date_quarter.quarter_id,
+   'left_outer'))                      # snowflake 계층을 여기서 미리 눌러 담음
+
+full_visit = (fact_visit
+ .join(page_w_category, fact_visit.dim_page_id == page_w_category.page_id,
+  'left_outer')
+ .join(date_w_month_quarter, fact_visit.dim_date_id == date_w_month_quarter.date_id,
+  'left_outer')
+)
+
+full_visit.write.mode('overwrite').format('delta').save(get_one_big_table_dir())
+
+# reading — 조인이 단 한 줄도 없음
+visits_table = spark_session.read.format('delta').load(get_one_big_table_dir())
+```
+
+**예시 2 — star 스키마의 쓰기와 읽기 (Example 8-26)**
+
+**살짝만 정규화된 비정규화 스토리지** 인 star 스키마는 쓰기 단계에서 **테이블을 더 많이 만들고**,
+그 결과 **읽기 단계에도 조인이 남음**. 앞의 One Big Table 은 전부 평탄화되어 있어 그렇지 않았음.
+
+```python
+# writing — dimension 을 각각 별도 테이블로 저장 (계층은 미리 평탄화)
+page_with_category = dim_page.join(dim_page_category,
+  dim_page.dim_page_category_id == dim_page_category.page_category_id,
+  'left_outer').dropDuplicates()       # dimension 이라 중복 제거 필수
+page_with_category.write.mode('overwrite').format('delta').save(output_page)
+
+date_with_month_and_quarter = (dim_date
+ .join(dim_date_month, dim_date.dim_month_id == dim_date_month.month_id,
+ 'left_outer')
+ .join(dim_date_quarter, dim_date.dim_quarter_id == dim_date_quarter.quarter_id,
+ 'left_outer')).dropDuplicates()
+(date_with_month_and_quarter.write.mode('overwrite').format('delta')
+  .save(output_date_dir))
+
+visits_dataset = (spark_session.read
+  .schema('visit_id STRING, event_time TIMESTAMP,     page STRING')
+  .format('json').load(input_visits_dir))
+fact_visit = (visits_dataset.selectExpr(
+ 'visit_id', 'HASH(page) AS dim_page_id',
+  'HASH(TO_DATE(event_time)) AS dim_date_id',        # 대리키를 해시로 생성
+  'DATE_FORMAT(event_time, "HH:mm:ss") AS event_time'
+))
+fact_visit.write.mode('overwrite').format('delta').save(output_visits_dir)
+
+# reading — One Big Table 과 달리 조인 2회가 남음 (그래도 #57 의 6회보다는 적음)
+fact_visit = spark_session.read.format('delta').load(output_visits_dir)
+dim_date = spark_session.read.format('delta').load(output_date_dir)
+dim_page = spark_session.read.format('delta').load(output_page_dir)
+
+full_visit = (fact_visit
+  .join(dim_date, fact_visit.dim_date_id == dim_date.date_id, 'left_outer')
+  .join(dim_page, [fact_visit.dim_page_id == dim_page.page_id], 'left_outer'))
+```
+
+#### 비교 — 같은 visits 를 세 가지로 표현하면
+
+| 표현 | 조회 시 조인 | 갱신 비용 | 저장 공간 | 정합성 |
+|---|---|---|---|---|
+| **#57 정규형 / snowflake** | 6회 (Example 8-23) | 한 곳만 바꾸면 끝 | 최소 | 강함 — 정보가 한 번만 존재 |
+| **#58 star 스키마** | 2회 (Example 8-26) | dimension 한 곳 | 중간 — 서브디멘션 값 반복 | 중간 |
+| **#58 One Big Table** | 0회 (Example 8-25) | 관련 row 전부 `UPDATE` | 최대 — 모든 속성 반복 | 약함 — 스냅샷으로 봐야 안전 |
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — One Big Table 을 도메인 경계 없이 키워 놓으면 아무도 안 쓰는 300컬럼 테이블이 됨.</summary>
+<div markdown="1">
+
+**예 —** `visits_with_context` 로 시작한 테이블에 요청이 들어올 때마다 컬럼을 붙여
+**컬럼 312개** 가 됨. 컬럼 목록만 봐서는 `favorite_color` 가 방문 시점 값인지 현재 값인지 알 수 없고,
+분석가마다 다르게 해석해 **같은 지표가 팀별로 다르게 집계** 됨.
+게다가 Parquet footer 의 컬럼 메타데이터만으로도 파일당 수 MB 가 되어
+`#54 Metadata Enhancer` 가 기대한 스킵 효과도 떨어짐.
+
+**권장 —** 컬럼을 추가하기 전에 **테이블 이름을 다시 붙여 볼 것**.
+`and`·`with` 로 이어 붙여야 이름이 만들어지면 그 컬럼은 **다른 테이블에 속함**.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 비정규화 테이블을 "항상 최신" 으로 유지하려 들면 갱신 하나가 수억 row 를 건드림.</summary>
+<div markdown="1">
+
+**예 —** 디바이스 카탈로그에서 `device_full_name` 이 "local computer" → "Desktop (local)" 로 바뀜.
+정규화 모델이라면 `devices` 테이블 **1 row `UPDATE`** 면 끝이지만,
+One Big Table 에서는 그 디바이스로 들어온 **방문 2억 3천만 row 를 전부 재작성** 해야 함.
+Delta Lake `MERGE` 가 파티션 대부분을 재작성하면서 잡이 3시간을 넘기고,
+그 사이 조회하는 쪽은 **옛 이름과 새 이름이 섞인 결과** 를 보게 됨.
+
+**권장 —** 비정규화 테이블은 기본적으로 **스냅샷(특정 시점의 사실)으로 정의** 하고,
+"당시 이름" 이 맞는 답이 되게 만들 것. 정말 최신값이 필요한 속성만
+**정규화 테이블에 남겨 조회 시점에 조인** 하고, 저장 공간은 **딕셔너리 인코딩** 으로 눌러 둘 것.
+
+</div>
+</details>
+
+---
+
 ## 5. 요약
 
 챕터 8 은 **"데이터를 어떻게 배치해야 빠르고 싸게 읽히나"** 를 **나누기(파티셔닝)** → **묶고 정렬하기(레코드 조직화)**
@@ -2112,9 +2380,10 @@ broadcast 대신 **SortMergeJoin** 으로 떨어져 대시보드 쿼리가 4분�
 | #55 Dataset Materializer | Read Performance | 복잡한 레이아웃을 테이블·뷰로 구체화 | 반복 계산 제거·단일 접근점 / <br>refresh 비용·접근 정책 관리·저장 공간 |
 | #56 Manifest | Read Performance | 리스팅 연산 자체를 회피 | 리더의 LIST API 호출 제거·적재 멱등성 / <br>생성 단계 복잡도·매니페스트 비대화 |
 | #57 Normalizer | Data Representation | 데이터 저장을 엔티티 단위로 격리 | 정보 1회 저장·즉시 반영되는 갱신 / <br>여러 테이블 조인 비용·아카이빙(SCD) 필요 |
+| #58 Denormalizer | Data Representation | 테이블 사이의 조인 횟수를 줄임 | 조인 제거·네트워크 트래픽 감소 / <br>갱신 후 row 정합성·저장 공간·안티패턴 위험 |
 
 ```
-[챕터 8 선택 가이드 — #50~#57]
+[챕터 8 선택 가이드 — #50~#58]
 ──────────────────────────────────────────────────────────────────────
  ① 데이터를 나눌 때
    row 전체를 값별로 나눔 · 저카디널리티     ─► #50 Horizontal Partitioner (날짜·국가)
@@ -2135,7 +2404,7 @@ broadcast 대신 **SortMergeJoin** 으로 떨어져 대시보드 쿼리가 4분�
 
  ⑤ 무엇을 같이 저장할지 정할 때
    불변 속성 반복 · 갱신 정합성이 중요        ─► #57 Normalizer (NF / 스노우플레이크)
-   조인이 쿼리의 80% · 실행 시간이 중요       ─► #58 Denormalizer (본 문서 범위 밖)
+   조인이 쿼리의 80% · 실행 시간이 중요       ─► #58 Denormalizer (One Big Table / star)
 ──────────────────────────────────────────────────────────────────────
  ⚠ 파티션 키는 폭증(리스팅·small files)을, 버킷은 개수 고정(변경 시 backfill)을,
    정렬은 선행 컬럼 의존과 정렬 안 된 세그먼트를, 통계는 낡음을,
@@ -2160,5 +2429,5 @@ broadcast 대신 **SortMergeJoin** 으로 떨어져 대시보드 쿼리가 4분�
 
 > 저장을 아무리 잘 최적화해도 **다른 사람이 그 데이터를 쓰게 만들기엔 충분하지 않음**.
 > **가능한 최고 품질의 데이터** 를 함께 제공해야 하고, 그것이 **챕터 9 데이터 품질 디자인 패턴** 의 주제.
-> ※ 본 문서에서 다루지 않은 **#58 Denormalizer** — 조인이 쿼리의 80% 를 차지하던 회사 사례에서 출발해,
-> **One Big Table** 등으로 조인을 제거하는 대신 **row 정합성과 저장 공간** 을 내주는 패턴.
+> ※ 챕터 9 는 **품질 확보(#59 AWAP · #60 Constraints Enforcer)** → **스키마 일관성(#61 Schema Compatibility
+> Enforcer · #62 Schema Migrator)** → **품질 관찰(#63 Offline Observer · #64 Online Observer)** 순으로 이어짐.
