@@ -838,6 +838,7 @@ ValidationError:
 ```
 - visit_id="v1"는 2글자라 min_len=5 위반, event_time은 미래 값이라 lt_now 위반 — 두 문제 한 번에 리포트
 - Delta Lake의 all-or-nothing과 비슷하게, 검증 실패 시 메시지가 다음 단계로 못 넘어감
+
 ### 3단계: 검증 실패 시 실제 벌어지는 일
 ```python
 try:
@@ -947,7 +948,7 @@ ERROR: 잘못된 visit 이벤트, Kafka 발행 안 함:
 
 
 
-# ### 패턴 #61: 스키마 호환성 적용자 (Schema Compatibility Enforcer)
+# 패턴 #61: 스키마 호환성 적용자 (Schema Compatibility Enforcer)
 
 
 ## (1) 문제상황
@@ -1078,6 +1079,89 @@ v2: {visit_id, page, device_type}   ← device_type 필드 추가되면서 버�
 - 3번(새 코드가 옛날 데이터 읽기)을 보장하는 게 **Backward compatibility**
 - 4번(옛날 코드가 새 데이터 읽기)을 보장하는 게 **Forward compatibility**
 
+
+
+### 프레임워크별 스키마 관리 방법
+### 1. Kafka (Schema Registry)
+
+- 저장 위치: Schema Registry 서버 (내부적으로 Kafka의 `_schemas` 토픽에 저장)
+- 등록 시점: producer가 스키마와 함께 메시지를 처음 보낼 때 자동 등록
+- 버전 관리: subject(토픽별 이름)마다 버전 번호(1, 2, 3...)가 자동으로 매겨짐
+- 호환성 모드: subject 단위로 명시적 설정 (BACKWARD, FORWARD, FULL 등)
+```bash
+curl -X PUT http://schema-registry:8081/config/visits-topic-value \
+  -H "Content-Type: application/json" \
+  -d '{"compatibility": "BACKWARD"}'
+```
+
+
+### 2. Delta Lake
+- 저장 위치: 테이블 자체의 메타데이터 로그(`_delta_log/`)
+- 등록 시점: `CREATE TABLE` 시점에 v1, 이후 `ALTER TABLE`이나 `mergeSchema` 옵션으로 새 버전 생성
+- 버전 관리: 별도 버전 번호 개념보다는, 매 스키마 변경이 로그에 순차적으로 append됨
+- 호환성 모드: 명시적 backward/forward 설정 없음 — 기본은 엄격 거부, `mergeSchema` 옵션으로 완화 가능
+```python
+new_data.write.format("delta").option("mergeSchema", "true").mode("append").save(table_path)
+```
+
+
+### 3. Protobuf — 어떤 프레임워크와 엮여서 쓰이나
+- Protobuf 자체는 "데이터 직렬화 포맷"일 뿐, 실제로 누가 이 데이터를 주고받느냐는 별개의 프레임워크에 달림. 3갈래로 쓰임
+
+**3-1. gRPC — Protobuf가 원래 태어난 용도**
+```protobuf
+service VisitService {
+  rpc GetVisit (VisitRequest) returns (Visit);
+}
+```
+
+- Google이 gRPC(원격 프로시저 호출 프레임워크)를 만들면서, 그 통신용 직렬화 포맷으로 Protobuf를 같이 설계함
+- `.proto` 파일 하나로 메시지 구조뿐 아니라 API 함수 시그니처(서비스 정의)까지 같이 정의
+- 마이크로서비스 간 내부 API 통신에 주로 씀 — REST/JSON보다 빠르고 타입 안전
+
+
+**3-2. Kafka — Avro의 대안으로 추가된 옵션**
+```
+[producer 앱] → Visit을 Protobuf로 직렬화 → [Kafka 토픽] → [consumer 앱이 역직렬화]
+```
+- Confluent Schema Registry는 Avro뿐 아니라 Protobuf 스키마 등록·검증도 지원
+- gRPC로 이미 마이크로서비스 통신을 Protobuf로 하던 조직이, Kafka 이벤트에도 같은 `.proto` 스키마를 재사용하는 경우가 실무에서 흔함 — 스키마를 두 번 안 만들어도 됨
+
+**3-3. 파일 저장/배치 처리 — 별도 프레임워크 없이 단독 사용**
+```python
+with open("visits.pb", "wb") as f:
+    f.write(visit.SerializeToString())
+```
+- Spark 같은 배치 엔진도 Protobuf 파일을 읽고 쓸 수 있음 (Parquet/Avro만큼 표준은 아님)
+- 이 경우엔 각 언어의 protobuf 컴파일러가 생성한 클래스만 있으면 되고, 별도 프레임워크 불필요
+- 저장 위치: `.proto` 파일이 Git 같은 코드 저장소에 존재
+- 등록 시점: `.proto` 파일 작성 후 커밋하는 시점
+- 버전 관리: Git 커밋 이력이 버전 이력. 필드마다 붙는 필드 번호(`= 1`, `= 2`)도 일종의 식별자
+- 호환성 모드: 명시적 설정 개념은 약함, `buf breaking` 같은 도구로 커밋 전에 사전 검사
+
+
+### 한눈에 비교
+
+| 구분        | Kafka                       | Delta Lake                 | Protobuf                        |
+| --------- | --------------------------- | -------------------------- | ------------------------------- |
+| 저장 위치     | Schema Registry (별도 서버)     | 테이블 메타데이터 로그               | Git 저장소의 .proto 파일              |
+| 등록 시점     | 메시지 첫 전송 시 자동               | CREATE TABLE 시 / 쓰기 시 옵션으로 | 파일 커밋 시                         |
+| 버전 매기는 방식 | 자동 증가 번호                    | 로그 append (번호 개념 약함)       | Git 커밋 + 필드 번호                  |
+| 호환성 모드 설정 | 명시적 (BACKWARD/FORWARD/FULL) | 옵션(mergeSchema)으로 암묵적 완화   | 도구(buf)로 사전 검사                  |
+| 검증 시점     | 메시지 전송 직전 (API 호출)          | 쓰기 시도 순간 (엔진 자동 비교)        | 커밋/CI 시점 (buf breaking)         |
+| 연결 프레임워크  | Kafka(메시징)                  | Spark/Delta 엔진(배치)         | gRPC(주 용도) / Kafka(보조) / 파일(단독) |
+|           |                             |                            |                                 |
+
+### 엔지니어 독백
+> 이 표를 정리해놓고 보면, 결국 "검증을 언제 하느냐"가 셋의 제일 큰 차이다. Kafka는 런타임(메시지 보낼 때), Delta Lake도 런타임(쓸 때), Protobuf는 그보다 훨씬 이른 시점인 커밋/빌드 타임에 검증한다.
+> 
+> 그리고 Protobuf는 신입 때 "Kafka 전용 기술"로 오해하기 쉬운데 사실은 반대다. gRPC를 위해 태어났고, Kafka에 쓰이는 건 나중에 Avro 대안으로 추가된 옵션이다. 그래서 "이 회사는 Protobuf 쓴다"고 하면 보통 gRPC로 마이크로서비스끼리 통신하는 조직일 확률이 높고, 그런 조직이 Kafka도 같이 쓰면 이미 만들어둔 `.proto` 스키마를 그대로 재사용하는 경우가 많다.
+> 
+> 검증 시점이 이를수록 사고를 더 싸게 막는다는 것도 기억해둘 만하다. Protobuf처럼 커밋 시점에 걸리면 코드 리뷰에서 바로 잡히지만, Kafka나 Delta Lake처럼 런타임에 걸리면 이미 배포된 파이프라인이 돌다가 에러를 만나는 거라 대응 비용이 더 크다. 요즘 Kafka 쪽도 CI 단계에서 미리 스키마 검증을 하려는 트렌드가 있는 이유가 이거다.
+
+
+
+
 ### 스키마 호환성 모드 3가지 (기준: 누구를 기준으로 맞추는가)
 - 1. Backward compatibility (하위 호환)
     - 기준: 새 버전 consumer가 옛날 데이터를 읽어야 함
@@ -1096,31 +1180,180 @@ v2: {visit_id, page, device_type}   ← device_type 필드 추가되면서 버�
     - 적용 상황: 여러 팀이 동시에 쓰는 핵심 공용 이벤트 스키마
     - 허용되는 변경: optional 필드 추가/삭제만 (가장 좁음)
 
+
+### Backward / Forward Compatibility — 플랫폼별 예시 
+
+### 1. Kafka — Backward / Forward
+
+**Backward (새 코드 v2 → 옛날 데이터 v1)**
+```python
+# v2 consumer 코드 — device_type을 참조
+for message in consumer:
+    visit = deserialize(message.value)
+    device = visit.get('device_type', None)  # optional로 추가됐다면 None 처리 가능
+```
+- v1으로 저장된 옛날 메시지를 이 코드가 읽어도, `device_type`이 optional이면 `None`으로 처리되고 안 죽음
+
+**Forward (옛날 코드 v1 → 새 데이터 v2)**
+```python
+# v1 consumer 코드 — device_type을 아예 모름
+for message in consumer:
+    visit = deserialize(message.value)
+    print(visit.visit_id, visit.page)  # device_type 필드는 코드에 아예 없음
+```
+
+- v2로 만들어진 새 메시지에 `device_type`이 섞여 있어도, 이 코드는 그 필드를 아예 안 쳐다보니 무시하고 넘어감
+
+
+### 2. Delta Lake — Backward / Forward
+
+**Backward (새 코드가 옛날 파티션 읽기)**
+```python
+# v2 스키마 기준 코드 — ad_id 컬럼 있다고 가정하고 짬
+df = spark.read.format("delta").load(table_path)
+df.select("visit_id", "ad_id").show()
+```
+- 만약 과거에 쌓인 파티션에 `ad_id`가 없다면? Delta Lake는 스키마 진화(schema evolution)가 켜져 있으면 없는 컬럼은 NULL로 채워서 읽어줌 — optional 추가라면 문제없음
+- 만약 `ad_id`가 NOT NULL로 강제돼 있었다면, 옛날 파티션엔 그 값이 없어서 읽기 자체가 실패할 수 있음
+
+
+**Forward (옛날 코드가 새 파티션 읽기)**
+```python
+# v1 스키마 기준 코드 — ad_id를 아예 모름
+df = spark.read.format("delta").load(table_path)
+df.select("visit_id", "page").show()
+```
+- 새로 쌓인 파티션에 `ad_id` 컬럼이 추가돼 있어도, 이 코드는 `visit_id`, `page`만 select하니까 문제없이 동작
+
+
+### 3. Protobuf — Backward / Forward
+
+**Backward (새 코드 클래스가 옛날 직렬화 데이터 읽기)*
+```python
+# v2 .proto로 재생성된 Visit 클래스
+visit = Visit()
+visit.ParseFromString(old_v1_bytes)   # v1 시절에 저장된 바이트를 v2 클래스로 파싱
+print(visit.device_type)  # proto3에서 optional 필드는 기본값(빈 문자열 등)으로 채워짐
+```
+- Protobuf는 proto3부터 필드가 기본적으로 optional 취급이라, 없는 필드는 자동으로 기본값(zero value)으로 채워짐 — 파싱 자체는 안 깨짐
+
+
+
+**Forward (옛날 코드 클래스가 새 직렬화 데이터 읽기)**
+```python
+# v1 .proto로 생성된 Visit 클래스 (device_type 필드 자체가 클래스에 없음)
+visit = Visit()
+visit.ParseFromString(new_v2_bytes)   # v2가 만든, device_type 포함된 바이트를 v1 클래스로 파싱
+```
+- Protobuf는 모르는 필드를 자동으로 무시하고 넘어감(unknown field로 보존은 하되 에러 안 냄) — 안 죽음
+
+### 정리 — 플랫폼마다 "안 죽는 방식"은 다르다
+
+|플랫폼|Backward 안전장치|Forward 안전장치|
+|---|---|---|
+|Kafka (Avro)|optional 필드는 없으면 None/default 처리|옛날 코드가 새 필드를 코드에 안 넣었으면 그냥 무시|
+|Delta Lake|schema evolution 켜져 있으면 없는 컬럼 NULL 처리|select 안 한 컬럼은 그냥 안 읽힘|
+|Protobuf|optional 필드는 zero value로 자동 채워짐|모르는 필드는 unknown field로 무시|
+
+### 엔지니어 독백
+> 셋 다 "안 죽는다"는 결과는 같은데, 그 밑에서 실제로 일어나는 메커니즘은 플랫폼마다 다르다. Kafka/Avro는 Schema Registry가 사전에 등록을 막아주는 것과 별개로, 실제 파싱 레벨에서도 저런 처리가 있고, Protobuf는 애초에 프로토콜 설계 자체가 "모르는 필드는 무시한다"는 걸 기본 철학으로 깔고 간다. Delta Lake는 schema evolution 옵션을 안 켜두면 오히려 이런 유연함이 하나도 없이 그냥 다 막아버린다는 게 차이점이다.
+
+
+
 ### Transitive vs Nontransitive (기준: 몇 버전 전까지 보장하는가)
-- 배경
-    - backward/forward는 기본적으로 인접한 두 버전(v, v+1)만 비교
-    - 실무에서 과거 데이터를 오래 보관하고 나중에 재처리(reprocessing)하는 경우, 멀리 떨어진 버전 간 호환도 중요해짐
-- Nontransitive: 인접한 두 버전끼리만 호환성 보장
-- Transitive: 모든 과거·미래 버전 간 호환성 보장
+#### 엔지니어 독백 — 도입
+
+> 지금까지 backward, forward는 다 "바로 옆 버전(v1↔v2)"끼리만 비교했다. 근데 실무에서 데이터를 오래 쌓아두는 팀은 v1이 아니라 6개월 전 v0 데이터를 지금 v5 코드로 다시 읽어야 하는 상황이 생긴다. 바로 옆 버전끼리만 안전하다고 해서, 멀리 떨어진 버전끼리도 안전하다는 보장은 없다. 이 문제를 다루는 게 transitive/nontransitive다.
+#### 배경
+- backward/forward는 기본적으로 인접한 두 버전(v, v+1)만 비교
+- 실무에서 데이터를 오래 보관하고 나중에 재처리(reprocessing)하는 경우, 멀리 떨어진 버전 간 호환도 중요해짐
+#### 정의
+- Nontransitive: 인접한 두 버전끼리만 호환성 보장 (v1↔v2, v2↔v3는 보장하지만 v1↔v3는 보장 안 함)
+- Transitive: 모든 과거·미래 버전 간 호환성 보장 (v1↔v2↔v3 전부 다 보장)
+
+#### 다음 예시로 감을 잡는다
+- order 데이터셋의 amount 필드가 v0(없음) → v1(optional, 기본값 0.0) → v2(required)로 바뀌는 사례
+- v1→v2는 nontransitive 기준으로 통과하지만, v0→v2는 transitive 기준으로 위반됨 — 이걸 다음에 실제 값으로 확인한다
+
 
 ### 사례: Transitive vs Nontransitive 실제 차이
 
-- 배경: order 데이터셋의 amount 필드를 두 번에 걸쳐 변경
-- v0: `order_id LONG REQUIRED` (amount 자체가 없음)
-- v1: `order_id LONG REQUIRED`, `amount DOUBLE DEFAULT 0.0`
-    - amount 추가, backward 규칙 지키려고 optional + 기본값 0.0
-- v2: `order_id LONG REQUIRED`, `amount DOUBLE REQUIRED`
-    - product team 요청: "0.0 기본값이면 진짜 0원 주문과 값 없어서 채워진 주문을 구분 못 함" → default 제거, amount 필수화
-- v1 → v2 (nontransitive 기준)
-    - v2 consumer가 v1 데이터 읽음 → v1엔 amount 값이 이미 채워져 있었음 → 통과
-- v0 → v2 (transitive 기준)
-    - v2 consumer가 v0 데이터 읽음 → v0엔 amount 필드 자체가 없음
-    - v2는 amount가 REQUIRED라 기본값 채울 방법 없음 → 읽기 불가
-    - **호환성 위반**
-- 결론: 같은 v1→v2 변경도 nontransitive면 허용, transitive면 거부됨. 옛날 데이터(v0)를 나중에 다시 읽어야 하는 환경이면 transitive로 이런 사고를 사전 차단해야 함.
+#### v1, v2가 변경사항
+```
+v0: {order_id}                                    ← amount 필드 자체가 없음
+v1: {order_id, amount DOUBLE DEFAULT 0.0}         ← amount 있음, optional인데 기본값 0.0
+v2: {order_id, amount DOUBLE REQUIRED}            ← amount 있음, required
+```
+
+#### 핵심: v1 데이터는 "optional"이어도 실제로는 amount 값이 항상 존재한다
+- v1이 "optional"이라는 건 **스키마 선언**이 optional이라는 뜻이지, 실제로 저장된 데이터에 그 값이 없다는 뜻이 아니다
+- v1은 default 값이 `0.0`으로 정해져 있어서, producer가 amount를 안 넣어도 시스템이 자동으로 `0.0`을 채워 넣는다
+- 결과적으로 **v1으로 저장된 모든 레코드는 amount 필드에 실제 값이 다 들어있다** (사람이 넣었든, 기본값으로 채워졌든)
+
+```
+v1 데이터 실제 저장 형태:
+{order_id: 501, amount: 29.99}   ← 사람이 직접 넣은 값
+{order_id: 502, amount: 0.0}     ← 안 넣었지만 기본값으로 자동 채워짐
+
+→ 어느 쪽이든 amount 필드에 "값이 없는" row는 존재하지 않음
+```
+
+#### 그래서 v2(required) 코드가 v1 데이터를 읽어도 문제없다
+- v2 코드는 "amount가 반드시 있어야 한다"고 요구하는데, v1 데이터는 이미 (기본값이든 실값이든) amount가 다 채워져 있다
+- 요구하는 것과 실제로 있는 것이 일치 → 안 깨짐
+
+#### 반면 v0은 애초에 amount 필드가 없었다
+```
+v0 데이터 실제 저장 형태:
+{order_id: 100}   ← amount라는 개념 자체가 없음, 채울 기본값도 없음
+```
+- v2 코드가 v0 데이터에서 amount를 찾으면 → 정말로 아무것도 없음, 채울 방법도 없음 → 깨짐
+
+#### 이게 nontransitive/transitive와 연결되는 지점
+- **Nontransitive**: v1→v2만 체크 → v1은 항상 값이 있었으니 통과
+- **Transitive**: v0→v1→v2 전체를 체크 → v0까지 거슬러 올라가면 값이 없는 지점이 나와서 위반
+- 즉 nontransitive는 "가장 가까운 과거"만 보니까 운 좋게 통과하지만, transitive는 "제일 먼 과거"까지 다 보니까 숨어있던 구멍(v0)을 찾아낸다
+
+#### 엔지니어 독백
+> 이 부분이 실무에서 제일 헷갈리는 지점이다. "required 추가 = 무조건 위험"이라고 단순하게 외우면 안 된다. 진짜 기준은 "이 필드가 이전 버전에서도 항상 값을 갖고 있었는가"다. optional이어도 default 값이 있으면 사실상 항상 값이 있는 거나 마찬가지라, required로 승격시켜도 안전할 수 있다.
+> 
+> 그래서 나는 필드를 optional로 처음 추가할 때 항상 default 값을 신중하게 정한다. 나중에 "이 필드를 필수로 바꾸고 싶다"는 요구가 오면, default가 이미 잘 설계돼 있으면 그냥 required로 바꿔도 nontransitive 기준으로는 안전하게 넘어갈 수 있으니까.
+
+
+#### "과도기"로 이해하면 딱 맞다
+```
+v0: amount 없음
+        │
+        ▼  ← 과도기 시작: 일단 optional + 기본값으로 필드를 슬쩍 끼워넣음
+v1: amount OPTIONAL (default 0.0)
+        │
+        ▼  ← 과도기 끝: 이제 다 채워져 있다는 확신이 생겼으니 required로 승격
+v2: amount REQUIRED
+```
+- v1이라는 중간 단계가 바로 그 "과도기" 역할을 한다
+- 이 단계에서 강제는 안 하지만, 기본값으로 실질적으로는 "항상 값이 있는" 상태를 미리 만들어둔다
+- 그다음 v2에서 "이제 진짜로 필수다"라고 못을 박아도, 이미 v1부터 사실상 다 채워져 있었으니 아무도 안 깨진다
+
+#### 왜 굳이 이렇게 두 단계로 나누나 — 한 번에 required로 못 가는 이유
+- v0에서 바로 v1을 `amount REQUIRED`로 만들었다면?
+    - v0 데이터엔 amount가 없어서, 그 즉시 backward compatibility 위반 → Schema Registry가 등록 자체를 거부
+- 그래서 무조건 **optional로 먼저 끼워넣고, 데이터가 다 채워질 시간을 준 다음, required로 승격**하는 2단계 절차가 필요한 것
+
+#### 이게 실무에서 일반적인 스키마 진화 패턴
+```
+1단계: 필드를 optional + 합리적인 default로 추가 (과도기 시작)
+2단계: 일정 기간 대기 — 이 기간 동안 모든 producer가 실제로 값을 채우도록 유도
+3단계: 데이터가 다 채워졌다고 확신되면, required로 승격 (과도기 종료)
+```
+
+#### 엔지니어 독백
+> 이 패턴을 "expand-contract" 패턴이라고도 부른다. 먼저 넓게(expand) 열어서 과도기를 만들고, 나중에 좁게(contract) 조여서 확정한다. 스키마뿐 아니라 API 버전 관리, DB 마이그레이션에서도 똑같은 원리가 쓰인다.
+> 
+> 신입 때 "왜 한 번에 필수로 안 하고 이렇게 번거롭게 두 단계로 가지?" 싶을 텐데, 한 번에 가면 무조건 기존 데이터/consumer가 깨진다. 과도기 없이 스키마를 바꾸는 건 사실상 불가능하다고 보면 된다.
+
+
 
 ### 실무 선호 — 상황별
-
 - Backward compatibility
     - 적합 상황: 데이터 레이크/웨어하우스처럼 과거 데이터를 계속 쌓고 재조회하는 환경
     - 가장 흔하게 쓰는 기본값
@@ -1216,6 +1449,9 @@ the old schema has no default value and is missing in the new schema'}]
 - Schema Registry가 "이 필드를 기대하는 기존 consumer가 있다"고 판단해 등록 거부
 - backward compatibility 관점: required 필드 삭제는 옛날 스키마 형식을 못 지키는 변경이라 위반 처리됨
 
+
+
+
 ### 예시2: Delta Lake — 1단계: 기존 테이블 스키마
 ```
 root
@@ -1256,6 +1492,55 @@ root
 
 - `ad_id`가 테이블 스키마엔 없어서 거부
 - Kafka와의 차이: Kafka는 별도 서버가 판단, Delta Lake는 엔진 자체가 즉석 비교 — (2)솔루션의 "암묵적 방식" 실제 동작
+
+### Delta Lake — Schema Evolution 켜고 끄는 법
+
+### 기본 동작: 기본값은 "꺼짐" (엄격 모드)
+
+- Delta Lake는 기본적으로 스키마가 다르면 무조건 쓰기를 거부한다 (앞서 본 `AnalysisException`)
+- Schema evolution은 **쓰기 시점에 옵션을 명시적으로 켜야만** 작동하는 기능
+
+### 켜는 방법 — 쓰기 코드에 옵션 추가
+```python
+# 옵션 없이 쓰면: 스키마 다르면 그냥 거부됨 (기본 동작)
+new_data.write.format("delta").mode("append").save(table_path)
+
+# mergeSchema 옵션을 켜면: 새 컬럼이 있어도 자동으로 테이블 스키마에 병합해서 허용
+new_data.write.format("delta") \
+    .option("mergeSchema", "true") \
+    .mode("append") \
+    .save(table_path)
+```
+- `mergeSchema=true`: 새로 들어오는 데이터에 있는 컬럼이 기존 테이블에 없으면, **테이블 스키마 자체를 업데이트**해서 그 컬럼을 추가해버림
+- 기존 row들은 그 새 컬럼에 대해 자동으로 NULL이 채워짐 (이게 "옛날 데이터에 없는 컬럼을 optional 취급"하는 실제 동작)
+
+### 세션 레벨로 항상 켜두는 방법
+```python
+spark.conf.set("spark.databricks.delta.schema.autoMerge.enabled", "true")
+```
+- 이 설정을 켜두면, 매번 `.option("mergeSchema", "true")`를 안 붙여도 모든 쓰기에 자동 적용됨
+- 실무에서는 보통 이걸 잡 단위로 켜두기보단, 명시적으로 매 쓰기마다 옵션을 붙이는 걸 선호 — 의도치 않은 스키마 변경이 조용히 반영되는 걸 막기 위해
+
+### 반대로 "덮어쓸 때" 스키마를 완전히 새로 정의하고 싶다면
+```python
+new_data.write.format("delta") \
+    .option("overwriteSchema", "true") \
+    .mode("overwrite") \
+    .save(table_path)
+```
+- `overwriteSchema=true`: 기존 스키마를 아예 무시하고, 이번에 쓰는 데이터의 스키마로 테이블 스키마를 통째로 교체
+- `mergeSchema`(추가)와 다르게 이건 기존 컬럼도 없앨 수 있는 훨씬 위험한 옵션 — 보통 완전히 스키마를 재설계할 때만 씀
+
+### 정리
+
+|옵션|동작|위험도|
+|---|---|---|
+|(옵션 없음, 기본값)|스키마 다르면 무조건 거부|안전 (제일 엄격)|
+|`mergeSchema=true`|새 컬럼 있으면 기존 스키마에 병합(추가)|중간 (컬럼 늘리는 것만 허용)|
+|`overwriteSchema=true`|스키마를 통째로 교체|위험 (컬럼 삭제도 가능)|
+
+### 엔지니어 독백
+> 실무에서 `mergeSchema`는 로그성 데이터(이벤트, 클릭스트림 등)처럼 필드가 계속 늘어나는 데이터셋에 자주 켜둔다. 근데 이걸 무분별하게 켜두면, producer 쪽에서 오타로 만든 컬럼(`devic_type` 같은)까지 그냥 테이블에 병합되어 버리는 사고가 난다. 그래서 `mergeSchema`를 켜더라도, 이 세션에서 배운 Constraints Enforcer(예상 컬럼 목록에 없는 건 거부)를 같이 걸어두는 게 안전하다.
 
 ### 최종 요약
 ```
