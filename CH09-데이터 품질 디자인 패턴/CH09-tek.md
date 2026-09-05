@@ -13,10 +13,14 @@
    - 패턴 #60: 제약 조건 적용자 (Constraints Enforcer)
 2. [스키마 일관성 (Schema Consistency)](#2-스키마-일관성-schema-consistency)
    - 패턴 #61: 스키마 호환성 적용자 (Schema Compatibility Enforcer)
-3. [요약](#3-요약)
+   - 패턴 #62: 스키마 마이그레이터 (Schema Migrator)
+3. [품질 관찰 (Quality Observation)](#3-품질-관찰-quality-observation)
+   - 패턴 #63: 오프라인 옵서버 (Offline Observer)
+   - 패턴 #64: 온라인 옵서버 (Online Observer)
+4. [요약](#4-요약)
 
-> 본 문서는 챕터 9 의 **#59~#61** — **9.1 Quality Enforcement · 9.2 Schema Consistency(전반)** — 을 다룸.
-> **#62 Schema Migrator** 와 **9.3 Quality Observation(#63 Offline Observer · #64 Online Observer)** 은 별도로 정리.
+> 본 문서는 **챕터 9 전체** — **#59~#64** — 를 다룸.
+> **#65 Flow Interruption Detector** 부터는 **챕터 10 데이터 관찰 가능성** 문서에서 정리.
 
 ---
 
@@ -42,7 +46,7 @@
                            유효한지 계속 관찰                    #64 Online Observer
 ──────────────────────────────────────────────────────────────────────
  흐름 — 값을 막고(9.1) → 스키마를 막고(9.2) → 막는 규칙 자체가 낡지 않게 지켜봄(9.3).
- ※ 본 문서는 9.1 전체와 9.2 의 #61 — 즉 #59~#61 을 다룸.
+ ※ 본 문서는 세 카테고리 전체 — 즉 #59~#64 를 다룸.
 ```
 
 **세 카테고리가 나뉜 이유**
@@ -55,10 +59,10 @@
   데이터셋을 관찰해야 함. 관찰 기법이 **처리 중인 데이터셋의 가장 최신 개요** 를 제공해
   강제 규칙을 최신 상태로 유지하게 해 줌.
 
-### 패턴 흐름 — 챕터 8에서 챕터 9 로
+### 패턴 흐름 — 챕터 8에서 챕터 10 으로
 
 ```
-[패턴 흐름 — 챕터 8에서 챕터 9 로]
+[패턴 흐름 — 챕터 8에서 챕터 10 으로]
 ──────────────────────────────────────────────────────────────────────
  챕터 8: 데이터를 나누고·묶고·정렬해 "빠르고 싸게 읽히게" 만듦
       │ 남은 과제: 아무리 잘 최적화해도 "남이 쓰게 만들기엔" 부족 — 신뢰가 없으면 안 씀
@@ -73,11 +77,18 @@
  9.2 Schema Consistency (스키마를 막기)
    #61 Schema Compatibility Enforcer — 호환되지 않는 스키마 변경을 거부
       │ (한계) 변경의 "종류" 만 통제. 의도적인 파괴적 변경은 어떻게?
-      ▼
-   #62 Schema Migrator — 컨슈머 (다운스트림)를 깨지 않고 스키마를 진화 (본 문서 범위 밖)
-      │
-      ▼
- 9.3 Quality Observation — 규칙이 낡지 않게 관찰 (#63·#64, 본 문서 범위 밖)
+      ▼ "필드 이름을 바로잡고 싶은데, 컨슈머를 깨지 않으려면?"
+   #62 Schema Migrator — 유예 기간 동안 옛 필드·새 필드를 함께 실어 보냄
+      │ (한계) 값도 스키마도 통제했지만, 통제 규칙 자체가 낡는 문제는 그대로
+      ▼ "내가 정한 규칙이 내일의 데이터도 덮는가?"
+ 9.3 Quality Observation (규칙이 낡지 않게 관찰)
+   #63 Offline Observer — 관찰을 별도 파이프라인으로 분리 (non-blocking)
+      │ (한계) 스케줄이 느슨하면 컨슈머 (다운스트림)가 먼저 이슈를 발견
+      ▼ "주 1회로는 늦다"
+   #64 Online Observer — 관찰을 생성 파이프라인 안으로 넣음
+      │ (한계) 데이터는 봤지만, 파이프라인이 "아예 안 돌았을 때" 는 못 봄
+      ▼ "AWAP 이 완벽해도 AWAP 잡이 안 돌면 소용없다"
+ 챕터 10 Data Observability — #65 Flow Interruption Detector 로 이어짐 (별도 문서)
 ──────────────────────────────────────────────────────────────────────
 ```
 
@@ -947,11 +958,751 @@ Delta 가 **조용히 새 컬럼을 추가** 해 버림. 원래 `event_time` 은
 
 ---
 
-## 3. 요약
+`#61 Schema Compatibility Enforcer` 는 **프로듀서가 비호환 변경을 하지 못하게** 막고,
+그런 변경이 가능한 환경에서 **컨슈머 (다운스트림)가 중단되지 않게** 보호.
+그러나 스키마 관련 문제가 하나 남음 —
+**컨슈머를 안전하게 유지하면서도, 필드 타입 진화·이름 변경 같은 파괴적 스키마 변경을 할 수 있게 하려면?**
+
+```
+[#61 이 막아 주는 것 vs #62 가 필요한 것]
+──────────────────────────────────────────────────────────────────────
+ #61 Schema Compatibility Enforcer
+   프로듀서가 실수로 visit_id 를 DROP           ✗ 거부  ⇒ 원하는 동작
+   프로듀서가 실수로 user_id 타입 변경           ✗ 거부  ⇒ 원하는 동작
+ #62 Schema Migrator 가 필요한 상황
+   from_page 라는 이름이 나빠서 referral 로 고치고 싶음  ✗ #61 이 거부  ⚠ 원치 않는 동작
+   흩어진 login·email·age 를 user 로 묶고 싶음          ✗ #61 이 거부  ⚠
+   ⇒ #61 은 "변경의 종류" 만 보므로, 의도한 파괴적 변경과 사고를 구분하지 못함.
+   ⇒ 구분해 주는 것은 규칙이 아니라 "유예 기간(grace period)" ⇒ #62 의 영역
+──────────────────────────────────────────────────────────────────────
+```
+
+---
+
+### 2-2. 패턴 #62: 스키마 마이그레이터 (Schema Migrator)
+
+> 스키마 정확성을 보장하면 프로듀서의 비호환 변경을 막고 컨슈머의 중단도 막아 줌.
+> 그런데 **의도적으로 파괴적 변경을 하고 싶을 때** 는 어떻게 할 것인가.
+
+#### 상황 (Problem)
+
+**책의 use case** — 친절하게 필드를 계속 더하다 보니 속성이 60개가 됨:
+
+- 잡이 다운스트림으로 생성하는 **방문 이벤트(visit event)의 구조를 개선** 하려는 중.
+- **첫날부터 사용자 친화적이고 싶었기 때문에**, 컨슈머 (다운스트림)를 번거롭게 하지 않으려고
+  **새 필드를 계속 추가만 해 왔음**.
+- 그 결과 **도메인 관련 필드들이 메시지 전체에 흩어졌고**, 어떤 메시지는 **속성이 60개까지** 감.
+  대부분의 용도에는 너무 많고, **도메인을 이해하는 일 자체가 매우 어려워짐**.
+- 많은 컨슈머가 **처리의 어려움과 복잡해진 도메인** 을 호소.
+  이상적으로는 **관련 속성이 같은 엔티티로 묶이길** 원함 —
+  예를 들어 `login` · `email address` · `age` 같은 사용자 관련 속성은
+  **`user` 라는 하나의 속성 아래** 있어야 함.
+- **기존 스키마를 급진적으로 바꾸고 싶지는 않음** — 그러면 호환성이 깨짐.
+  그러나 **속성 구성은 개선하고 싶고, 컨슈머에게는 새 포맷으로 옮길 시간을 주고 싶음**.
+- **결정적 제약**: 이 변경은 **사고가 아니라 의도한 파괴적 변경**.
+  `#61 Schema Compatibility Enforcer` 는 **변경의 종류만 통제** 하므로 이 요구를 풀 수 없음.
+
+```
+[문제의 구조] 친절함이 쌓여 만든 60개짜리 스키마
+──────────────────────────────────────────────────────────────────────
+ Day 1    visit_id · event_time · page                          속성 3개
+   │      "컨슈머 귀찮게 하지 말자" ⇒ 새 필드는 추가만
+ Month 6  + user_login + user_email + user_age + ad_id + ...    속성 20개
+   │
+ Today    + ... 총 60개, 도메인 경계 없이 평평하게 나열           속성 60개
+          컨슈머 ─► "login·email·age 는 user 로 묶어 달라"
+──────────────────────────────────────────────────────────────────────
+ ⚠ 지금 바로 ALTER 하면 컨슈머 쿼리가 즉시 깨짐.
+ ⚠ 아무것도 안 하면 스키마는 계속 비대해짐.
+ ⇒ 필요한 것은 "옛 것과 새 것이 공존하는 기간".
+```
+
+#### 해결 (Solution)
+
+**Schema Migrator 패턴** 은 **스키마 진화(schema evolution)를 가능하게** 함.
+
+> **참고 사항 — 전이 호환성 (Transitive Compatibility)**
+> Schema Migrator 는 **스키마 호환성이 전이적(transitive)이지 않을 것** 을 요구.
+> 그렇지 않으면 **필드 제거나 이름 변경이 아예 불가능** —
+> 전이 호환성 수준은 **모든 버전에 걸친 일관성** 을 보장하기 때문.
+
+**1단계 — 진화 유형 식별**. 세 가지 시나리오가 가능.
+
+- **Rename (이름 변경)**
+  - 나 또는 컨슈머가 **어떤 속성의 이름이 잘못됐거나 이해하기 어렵다** 고 판단할 때 발생.
+- **Type change (타입 변경)**
+  - **문제 진술의 시나리오**.
+  - 스키마를 **더 잘 구성** 하고 싶거나 (예: 여러 차례 변경 후 단순화),
+    **처리에 최적화** 하고 싶은 경우 (예: 이질적인 날짜/시간 텍스트 속성을 epoch timestamp 로 조정).
+- **Removal (제거)**
+  - 제거하려는 속성을 **처리하는 컨슈머 (다운스트림)가 없다는 100% 보장** 이 있으면 쉬움.
+  - 보장이 없다면 **대체재를 찾아 주거나, 제거 자체를 취소** 해야 함.
+
+**2단계 — rename · type change 처리**. 가장 까다로운 두 시나리오는 절차가 같음.
+
+- 먼저 **이름을 바꾼(또는 타입을 바꾼) 속성을 담은 새 필드를 생성**.
+- 다음으로 **컨슈머와 전환 기간(transition time)을 합의**.
+- 그 기간 동안 컨슈머는 **이전 속성과 새 속성을 동시에 수신**.
+- **데드라인에 도달한 뒤에야** 수정된 버전의 속성만 담은 **새 스키마 버전을 생성**.
+
+**3단계 — removal 처리**. 제거는 조금 다름 —
+**필드 제거 기간(field removal period)에 대해 컨슈머와 합의** 하고,
+데드라인이 지나면 **삭제된 속성이 없는 새 스키마 버전을 생성**.
+
+```
+[Schema Migrator 타임라인] from_page → referral 이름 변경
+──────────────────────────────────────────────────────────────────────
+ T0  스키마 v1        from_page                          컨슈머 전원 v1 사용
+       │ 새 필드 추가 (기존 필드는 그대로 둠)
+ T1  스키마 v2        from_page  +  referral             ⚠ 두 컬럼 동시 존재
+       │             ← 전환 기간 (grace period) →         레코드 크기 증가 구간
+       │             컨슈머가 하나씩 referral 로 이전
+ T2  데드라인          모든 컨슈머 이전 완료 확인          (#70 Fine-Grained Tracker 로 검증)
+       │ 옛 필드 제거
+ T3  스키마 v3                      referral             ✓ 깔끔한 최종 스키마
+──────────────────────────────────────────────────────────────────────
+ ⚠ 이 패턴의 전부는 T1~T2 구간 — "동시에 둘 다 보낸다".
+ ⚠ T2 를 정하지 않으면 T1 상태가 영구화되어 스키마가 계속 비대해짐.
+```
+
+> **참고 사항 — 데이터 계보 (Data Lineage)**
+> 어떤 속성이 컨슈머 (다운스트림)에 의해 **실제로 사용되는지 탐지** 하려면
+> 챕터 10 의 **Fine-Grained Tracker 패턴(#70)** 에 기댈 수 있음.
+
+#### 고려사항 (Consequences)
+
+Schema Migrator 는 **스키마 마이그레이션을 위한 유예 기간에 의존**.
+그 기간 동안 **옛 스키마가 여전히 유효** 하고 컨슈머가 처리할 수 있음. 이는 **데이터 크기에 영향**.
+
+- **Size impact (크기 영향)**
+  - 마이그레이션에 안전 장치를 제공하는 대신, **스토리지 공간 · 네트워크 전송 · I/O** 형태의 비용이 발생 —
+    저장할 데이터가 더 많아지기 때문.
+  - 어떤 데이터 포맷은 **필드가 많은 것을 공식적으로 권장하지 않음**.
+    예를 들어 **Protobuf 는 "Proto Best Practices" 에서 수백 개 필드 사용을 경고** —
+    **채워지지 않은 필드조차 최소 65바이트** 를 차지하기 때문.
+    Protobuf 가 생성하는 빌더의 전체 크기가 **Java 같은 언어의 컴파일 한계** 에 도달할 수도 있음.
+  - 크기는 **메타데이터·통계 계층에도 영향**.
+    집필 시점 기준 **Delta Lake 는 기본적으로 첫 32개 컬럼에 대해서만 통계를 수집**.
+    이 값을 바꿀 수는 있지만 **쓰기 시간에 영향** 을 줄 수 있음.
+- **Impossible removal (제거가 불가능한 경우)**
+  - 필드 제거 시나리오에는 구현상 한계가 있음.
+  - 어떤 컨슈머가 그 필드를 쓰고 있다면, **대체 속성을 제공할 수 없는 한 제거는 불가능**.
+
+#### 구현 예시 (Examples)
+
+스키마 마이그레이션 워크플로는 여러 기술에서 동일하므로,
+여기서는 **하나의 데이터 포맷** 에 집중해 **Schema Migrator 를 따르지 않으면 무슨 일이 생기는지** 확인.
+
+**예시 1 — 컨슈머의 쿼리 (Example 9-16)**
+
+이 예시의 컨슈머는 **로그인한 사용자의 방문** 을 전용 테이블로 추출 중:
+
+```sql
+INSERT INTO dedp.connected_users_visits
+ SELECT visit_id, event_time, user_id, page, ip, login, from_page FROM dedp.visits
+ WHERE is_connected = true AND from_page IS NOT NULL;
+```
+
+**예시 2 — 패턴 없이 바로 rename 했을 때의 오류 (Example 9-17)**
+
+`from_page` 컬럼의 이름이 나쁘고 `referral` 이 더 낫다는 것을 방금 깨달았다고 하자.
+**가장 나쁜 선택** 은 이름 변경 연산을 **바로 실행** 하는 것 —
+`ALTER TABLE dedp.visits RENAME COLUMN from_page TO referral`.
+컨슈머는 **새 데이터를 볼 수조차 없음** — 쿼리가 먼저 실패하기 때문:
+
+```
+ERROR: column "from_page" does not exist
+LINE 2:    SELECT visit_id, event_time, user_id,    ..
+```
+
+**예시 3 — Schema Migrator 방식의 rename (Example 9-18)**
+
+이 문제를 피하려면 **새 컬럼을 먼저 만들어** 이름 변경을 마이그레이션해야 함:
+
+```sql
+ALTER TABLE dedp.visits ADD COLUMN referral VARCHAR(25) NOT NULL
+```
+
+**이전 컬럼은 컨슈머가 워크로드를 적응시킨 뒤에야** 제거할 수 있음.
+
+> **참고 사항 — Protobuf 의 rename 은 왜 안전한가**
+> Protobuf 의 이름 변경 연산은 안전 —
+> **인코딩된 버전이 필드 이름을 저장하지 않고 태그(tag)만 저장** 하기 때문.
+> 다만 **타입 변경은 안전하지 않을 수 있음** (Protobuf 공식 문서 참고).
+> Protobuf 와 Delta Lake 도 비슷한 워크플로를 가지므로 책에서는 생략, GitHub 저장소에서 확인 가능.
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 유예 기간의 "종료일" 을 정하지 않으면 마이그레이션이 영원히 끝나지 않음.</summary>
+<div markdown="1">
+
+**예 —** `from_page` → `referral` 마이그레이션에서 새 컬럼만 추가하고 데드라인을 잡지 않았음.
+반년 뒤 확인해 보니 **컨슈머 7개 중 4개가 여전히 `from_page`** 를 읽고 있었고,
+그사이 같은 방식으로 진행한 마이그레이션이 3건 더 쌓여 **속성이 60개에서 71개** 로 늘어남.
+Protobuf 메시지가 비대해지면서 **빈 필드만으로 레코드당 700바이트 이상** 이 낭비됨.
+
+**반대 함정 —** 그렇다고 "안 쓰는 것 같으니 지우자" 며 임의로 DROP 하면
+분기 마감 리포트처럼 **한 달에 한 번만 도는 배치** 가 그때서야
+`column "from_page" does not exist` 로 터짐.
+
+**권장 —** 새 컬럼을 추가하는 PR 에 **제거 예정일을 티켓으로 함께 등록** 하고,
+데드라인 전에 **#70 Fine-Grained Tracker 로 실제 조회 여부를 확인** 한 뒤 제거할 것.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 마이그레이션 컬럼을 테이블 끝에 붙이면 Delta Lake 의 data skipping 이 조용히 죽음.</summary>
+<div markdown="1">
+
+**예 —** 이미 컬럼이 30개인 Delta 테이블에 마이그레이션용 컬럼 5개를 뒤에 추가함.
+Delta Lake 는 기본으로 **첫 32개 컬럼에만 통계(min/max/nullCount)를 수집** 하므로,
+새로 만든 `referral` 컬럼은 **33번째 이후로 밀려 통계 대상에서 제외**.
+`WHERE referral = 'newsletter'` 쿼리가 **data skipping 없이 전체 파일을 스캔** 하게 되어
+응답이 4초에서 90초로 늘어남. 쿼리는 성공하니 아무도 원인을 알아채지 못함.
+
+**권장 —** 마이그레이션 대상 컬럼은 **필터에 쓰이는지 먼저 확인** 하고,
+쓰인다면 `delta.dataSkippingNumIndexedCols` 를 조정하거나
+**컬럼 순서를 재배치** 할 것. 조정은 쓰기 시간을 늘리므로 값을 무작정 키우지는 말 것.
+
+</div>
+</details>
+
+---
+
+## 3. 품질 관찰 (Quality Observation)
+
+**데이터셋은 동적** 이라는 사실을 기억할 것. 데이터셋은 변하고,
+**오늘 정의한 제약 규칙이 내일은 유효하지 않을 수 있음**.
+그래서 데이터셋에 무슨 일이 일어나는지 **관찰** 하고,
+기존 규칙을 조정하거나 새 제약을 추가할 준비를 해 두는 것이 중요.
+
+```
+[관찰 패턴의 자리 — 파이프라인 대비 위치가 곧 패턴의 이름]
+──────────────────────────────────────────────────────────────────────
+ #63 Offline Observer                #64 Online Observer
+ ─────────────────────────────       ─────────────────────────────
+ 관찰 잡이 사는 곳:                    관찰 잡이 사는 곳:
+   별도 파이프라인 (분리)                생성 파이프라인 안 (내장)
+ 스케줄: 자유 (야간 일괄 등)            스케줄: 데이터 생성과 동시
+ 인사이트 도달: 늦음                    인사이트 도달: 생성 직후
+ 생성 파이프라인 영향: 없음              생성 파이프라인 영향: 있음 (지연·실패 전파)
+ ⇒ 둘의 차이는 "무엇을 재느냐" 가 아니라 "언제 재느냐" 뿐 — 관찰 로직 자체는 동일.
+ ⇒ 선택 기준은 "정확한 시점을 얻기 위해 얼마나 비용을 낼 의향이 있는가".
+──────────────────────────────────────────────────────────────────────
+```
+
+---
+
+### 3-1. 패턴 #63: 오프라인 옵서버 (Offline Observer)
+
+> 관찰 패턴은 **데이터 파이프라인에서 차지하는 자리** 로 구분 가능.
+> 첫 번째 유형은 **데이터 처리 워크플로에 간섭하지 않는 별도의 관찰 컴포넌트** 로 존재.
+
+#### 상황 (Problem)
+
+**책의 use case** — 지금은 멀쩡하지만 이전 프로젝트 경험상 곧 깨질 것을 아는 상황:
+
+- 이번 달에 **새 데이터 파이프라인을 시작** 했고, **데이터 품질 이슈는 많이 겪지 않았음**.
+- 데이터셋은 **완전히 구조화** 되어 있고, **모든 비즈니스 규칙이 품질 확보 패턴으로 올바르게 강제** 되는 중.
+- 그러나 **이전 프로젝트 경험상 이 상태가 지속되지 않을 것** 을 앎 —
+  **업스트림 데이터셋이 앞으로 몇 달간 진화** 할 것이기 때문.
+- 그래서 **값의 분포(distribution of values)** 나 **컬럼별 NULL 개수** 같은
+  **데이터셋의 속성을 모니터링** 하고 싶음.
+- **결정적 제약**: **지금은 모든 것이 정상** 이므로,
+  이 **모니터링 계층이 메인 파이프라인을 막아서는 안 됨**.
+
+#### 해결 (Solution)
+
+모니터링이 처리 워크플로를 막지 않아야 하는 시나리오라면 **Offline Observer 패턴** 이 최선.
+
+- 구현은 **데이터 관찰 가능성 잡(data observability job)을 만드는 것** 으로 구성.
+  이 잡이 **처리된 레코드를 분석** 하고 **기존 모니터링 계층에 추가 인사이트를 더함**.
+- 인사이트는 **비즈니스 맥락에 따라 다르지만** 다음을 포함할 수 있음:
+  - **값의 분포**
+  - **nullable 필드의 NULL 개수**
+  - **입력 데이터셋에 새로 생겼지만 아직 처리되지 않은 필드**
+- 그렇게 이 파라미터들을 저장해 두면 **시간에 따른 데이터 품질 이슈를 포착** 할 수 있음.
+- 데이터 관찰 잡은 **데이터 생성 프로세스에 영향을 주지 않음**.
+  **독립적으로 실행** 되고 **완전히 다른 스케줄로 실행될 수도 있음**.
+  예를 들어 모든 데이터 생성기가 낮 시간에 돈다면,
+  **자원 경합(resource concurrency)을 피하려고 관찰 잡을 전부 야간에** 스케줄할 수 있음.
+
+```
+[Offline Observer — 두 파이프라인이 서로를 모름]
+──────────────────────────────────────────────────────────────────────
+ [생성 파이프라인]  09:00 ─► 10:00 ─► 11:00 ─► ... ─► 23:00   (매시간)
+        │
+        └─► visits_output 테이블
+                  ▲
+                  │ (읽기만 함 — 쓰기 경로에 개입하지 않음)
+                  │
+ [관찰 파이프라인]                                    02:00     (야간 1회)
+        └─► 관찰 상태 기록 ─► 집계 ─► visits_monitoring 테이블 ─► 대시보드
+──────────────────────────────────────────────────────────────────────
+ ✓ 생성 잡은 관찰 잡의 존재를 모름 ⇒ 관찰이 실패해도 데이터는 정상 배포됨.
+ ⚠ 대신 09:00 에 들어온 이상 데이터를 알게 되는 시점은 다음 날 02:00.
+```
+
+> **참고 사항 — 관찰 가능성과 감사의 차이 (Observability Versus Auditing)**
+> **관찰 가능성은 감사와 같지 않음.**
+> **감사(audit)** 는 데이터셋을 **검증** 하고 **차단(blocking) 연산** —
+> 이슈를 감지하면 파이프라인을 막음.
+> **관찰 가능성(observability)** 은 데이터셋을 **모니터링** 하는 **비차단(nonblocking) 접근** —
+> 이슈 감지를 돕지만 **파이프라인의 진행을 막지는 않음**.
+
+#### 고려사항 (Consequences)
+
+데이터 생성과 데이터 관찰을 **분리(decorrelate)하는 것** 은 프로덕션 자원에 영향을 주지 않아 좋음.
+안타깝게도 동전의 뒷면이 있음.
+
+- **Time accuracy (시점 정확성)**
+  - 오프라인 관찰 잡은 **어떤 스케줄로도 실행 가능** 하고,
+    **데이터 생성기보다 훨씬 늦게** 돌 수도 있으므로 **적시에 일어나지 않을 수 있음**.
+  - 즉 **인사이트가 너무 늦게 도착** 할 수 있음 —
+    **모든 다운스트림 컨슈머가 새 품질 이슈를 담은 데이터셋을 이미 처리** 했을 수 있기 때문.
+- **Compute resources (컴퓨트 자원)**
+  - 관찰 잡이 옆에서 돌기 때문에 **데이터 생성 잡보다 덜 자주 스케줄하고 싶은 유혹** 이 생김.
+    예를 들어 **시간별 배치 처리** 에 대해 관찰 잡은 **24시간에 한 번** 만 실행하는 식.
+  - 유효한 접근이지만, **시간 단위 변경분 대신 24시간치를 한꺼번에 처리** 해야 하므로
+    **더 많은 컴퓨트 자원이 필요할 수 있음** 을 인지해야 함.
+  - 결국 **관찰 대상 데이터셋을 샘플링** 해 일부만 쓰는 것을 고려할 수 있음.
+    안타깝게도 부분집합만 뽑아 관찰하면 **흥미로운 관찰을 놓칠 수 있음**.
+
+#### 구현 예시 (Examples)
+
+**예시 1 — Airflow 관찰 파이프라인의 태스크 구성 (Example 9-19)**
+
+데이터 생성 파이프라인과 **다른 스케줄로 실행** 되어, 지금까지 생성된 데이터셋의 품질을 단언하고
+통계를 모니터링 계층에 기록:
+
+```python
+wait_for_new_data = SqlSensor(...)
+record_new_observation_state = PostgresOperator(...)
+insert_new_observations = PostgresOperator(...)
+wait_for_new_data >> record_new_observation_state >> insert_new_observations
+```
+
+**예시 2 — 관찰 상태 기록 쿼리 (Example 9-20)**
+
+처리할 새 데이터가 있을 때마다, 관찰 잡은 **처음·마지막 처리 row 의 ID 를 담은 새 관찰 상태를 기록**.
+이 연산은 **멱등성을 위해 필요** —
+관찰 대상 테이블에 **row 변경이 생기더라도 분석 범위가 동일하게(따라서 일관되게) 유지** 되도록 보장:
+
+```sql
+INSERT INTO dedp.visits_monitoring_state (execution_time, first_row_id, last_row_id)
+  SELECT
+   '{{ execution_date }}' AS execution_time,
+   MIN(id) AS first_row_id, MAX(id) AS last_row_id   -- 이번 관찰 창의 경계를 고정
+  FROM dedp.visits_output
+  WHERE id > COALESCE(
+    (SELECT last_row_id FROM dedp.visits_monitoring_state WHERE
+      execution_time = '{{ prev_execution_date }}'::TIMESTAMP),  -- 직전 실행이 어디까지 봤는지
+    0
+  )
+```
+
+**예시 3 — 데이터 관찰 쿼리 (Example 9-21)**
+
+이후 관찰 파이프라인은 **고정해 둔 first/last row ID 위에서 집계를 수행** 해 관찰 결과를 생성:
+
+```sql
+INSERT INTO dedp.visits_monitoring(execution_time, all_rows, invalid_event_time,
+ invalid_user_id, invalid_page, invalid_context)
+ SELECT
+  '{{ execution_date }}' AS execution_time,
+  COUNT(*) AS all_rows,
+  ...
+  SUM(CASE WHEN context IS NULL THEN 1 ELSE 0 END) AS invalid_context  -- 컬럼별 NULL 집계
+FROM dedp.visits_output
+ WHERE id BETWEEN
+ (SELECT first_row_id FROM dedp.visits_monitoring_state WHERE
+  execution_time = '{{ execution_date }}')
+ AND
+  (SELECT last_row_id FROM dedp.visits_monitoring_state WHERE
+  execution_time = '{{ execution_date }}');
+```
+
+**예시 4 — 스트리밍 파이프라인의 Offline Observer (Example 9-22)**
+
+스트리밍에서도 구현 가능. 배치와 마찬가지로 **처리된 데이터 위에서 도는 별도의 잡** 이
+관찰 결과를 생성. 여기서는 **프로듀서의 처리 지연** 과 **몇 가지 품질 지표** 를 분석:
+
+```python
+visits_to_observe = (input_data_stream
+ .selectExpr('CAST(value AS STRING)')
+ .select(functions.from_json(functions.col('value'), visit_schema).alias('visit'))
+ .selectExpr('visit.*')
+ .select('visit_id', 'event_time', 'user_id', 'page', 'context.referral',...)
+ )
+query = (visits_to_observe.writeStream.foreachBatch(generate_and_write_observations)
+.option('checkpointLocation', checkpoint_location).start())
+```
+
+**예시 5 — 데이터 프로파일 리포트 생성 (Example 9-23)**
+
+모든 관찰 로직은 `generate_and_write_observations` 함수 안에 있음.
+첫 단계에서는 **앞의 Airflow 버전과 동일한 데이터 관찰 쿼리를 실행** 하고,
+이어서 **`ydata-profiling` 라이브러리로 HTML 데이터 프로파일 리포트를 생성**:
+
+```python
+def generate_profile_html_report(visits_dataframe: DataFrame, batch_version: int):
+ profile = ProfileReport(visits_dataframe, minimal=True)
+ profile.to_file(f'{base_dir}/profile_{batch_version}.html')
+```
+
+생성된 HTML 페이지는 **관찰 대상 데이터셋의 특성** 을 기술하며,
+이를 근거로 **강제(enforcement) 단계의 품질 규칙을 추가·수정·삭제** 할 수 있음.
+
+```
+[Figure 9-4 재현] 관찰 대상 데이터셋의 데이터 프로파일 (ydata-profiling)
+──────────────────────────────────────────────────────────────────────────────
+ Dataset statistics                      | Variable types
+ ----------------------------------------+-------------------------
+ Number of variables       14            | Categorical      12
+ Number of observations    1830          | DateTime          2
+ Missing cells             4349          |
+ Missing cells (%)         17.0%         |
+──────────────────────────────────────────────────────────────────────────────
+ Variables
+ ------------------------------------------------------------------------------
+ visit_id   (Categorical, MISSING)      | event_time  (Date, MISSING)
+   Distinct           27                |   Distinct           393
+   Distinct (%)       1.5%              |   Distinct (%)       23.9%
+   Missing            183               |   Missing            183
+   Missing (%)        10.0%             |   Missing (%)        10.0%
+   Memory size        0.0 B             |   Minimum   2024-01-01 01:00:00
+                                        |   Maximum   2024-01-01 06:08:00
+──────────────────────────────────────────────────────────────────────────────
+ 이 리포트가 보여 주는 것 — 전체 셀의 17%가 결측이고, visit_id 조차 10%가 비어 있음.
+ ⇒ "visit_id 는 NOT NULL 이어야 한다" 는 제약이 빠져 있었다는 신호 ⇒ 강제 규칙을 갱신.
+ ⚠ Distinct 가 1830건 중 27개뿐이라는 점도 함께 읽어야 함 (식별자 후보인데 중복이 많음).
+```
+
+**예시 6 — 지연(lag) 탐지 함수 (Example 9-24)**
+
+지연 탐지는 **체크포인트 위치에 데이터 생성 잡이 마지막으로 커밋한 오프셋** 과
+**입력 토픽의 가장 최근 오프셋** 을 비교:
+
+```python
+def get_last_offsets_per_partition(self) -> Dict[str, int]:
+ last_processed_offsets = self._read_last_processed_offsets()   # 체크포인트에서 읽음
+ last_available_offsets = self._read_last_available_offsets()   # 토픽에서 읽음
+
+ offsets_lag = {}
+ for partition, offset in last_available_offsets.items():
+  lag = offset - last_processed_offsets[partition]              # 파티션별 지연
+  offsets_lag[partition] = lag
+ return offsets_lag
+```
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 관찰 범위를 시각 조건으로 잡으면 재실행할 때마다 숫자가 달라져 추세를 못 읽음.</summary>
+<div markdown="1">
+
+**예 —** `record_new_observation_state` 를 생략하고
+관찰 쿼리를 `WHERE created_at BETWEEN '{{ execution_date }}' AND ...` 로 작성함.
+그런데 관찰 대상 테이블이 늦게 도착한 데이터를 뒤늦게 UPSERT 하는 구조였고,
+같은 날짜에 대해 관찰 잡을 재실행하자 **`invalid_user_id` 가 412건에서 87건** 으로 바뀜.
+"품질이 좋아졌다" 로 보고했다가 다음 주에 다시 뒤집혀 대시보드 신뢰를 잃음.
+
+**권장 —** 관찰 범위는 **시각이 아니라 row ID 경계로 고정** 하고,
+그 경계를 별도 상태 테이블에 먼저 기록할 것. 관찰도 멱등해야 추세가 의미를 가짐.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 관찰 잡을 아끼려고 주기를 늘리면 관찰 잡 자체가 OOM 으로 죽음.</summary>
+<div markdown="1">
+
+**예 —** 시간별 생성 잡에 대해 관찰을 24시간 1회로 잡음.
+평소엔 문제없었으나 마케팅 캠페인 주간에 하루치가 **8억 건** 으로 불었고,
+`ydata-profiling` 이 전체를 메모리에 올리다 **executor OOM** 으로 종료.
+정작 품질 이슈를 가장 봐야 할 날에 **일주일 내내 관찰 공백** 이 생김.
+
+**권장 —** 관찰 주기는 생성 주기와 **최대 4배 이내** 로 두고,
+그보다 늘려야 한다면 `ProfileReport(minimal=True)` 와 **샘플링을 함께 적용** 할 것.
+샘플링은 일부 관찰을 놓치지만, 관찰이 아예 죽는 것보다는 나음.
+
+</div>
+</details>
+
+---
+
+### 3-2. 패턴 #64: 온라인 옵서버 (Online Observer)
+
+> **데이터 처리와 데이터 관찰 사이의 지연** 이 문제라면,
+> 더 실시간에 가까운 반대 패턴인 **Online Observer** 를 선택할 수 있음.
+
+#### 상황 (Problem)
+
+**책의 use case** — Offline Observer 가 잡긴 잡았는데 사용자보다 늦었음:
+
+- 지난주 **데이터 분석 동료들이 우편번호(zip code) 필드의 예상치 못한 포맷** 을 호소.
+- 알고 보니 **업스트림 데이터셋에 데이터 회귀(data regression)** 가 있었고,
+  **기존 데이터 신뢰 규칙으로는 막을 수 없었음**.
+- **Offline Observer 는 그 이슈를 실제로 발견** 했음.
+  그러나 **주 1회 실행** 이므로 **사용자보다 먼저 문제를 감지하지 못함**.
+- **결정적 제약**: 앞으로는 **컨슈머 (조회하는 쪽)가 품질 이슈를 먼저 알게 되는 상황을 피하고**,
+  **일주일보다 빨리 고칠 수 있어야** 함.
+
+#### 해결 (Solution)
+
+이 문제는 **Offline Observer 한계의 완벽한 예시** 이고,
+극복은 반대 패턴인 **Online Observer** 로 비교적 간단.
+
+- Online Observer 도 **관찰 지표를 생성하는 데이터 관찰 잡에 의존** 하는 것은 동일.
+  차이는 **실행 시점**.
+- Online Observer 의 잡은 **데이터 생성 파이프라인의 본질적인 일부(intrinsic part)** 이고,
+  그 결과 **생성된 인사이트가 데이터 생성 직후에 가용**.
+  이 접근은 **컨슈머 (다운스트림)와의 커뮤니케이션·기술 이슈를 상당수 예방**.
+
+**어디에 관찰 잡을 둘 것인가** — 데이터 생성기를 ETL/ELT 단계로 생각하면
+가장 인기 있는 자리는 **Transform 단계 뒤**.
+여기서 **Parallel Split 패턴(#37)** 또는 **Local Sequencer 패턴(#33)** 으로 관찰 잡을 오케스트레이션.
+
+```
+[Figure 9-5 재현] 배치 파이프라인에서 Online Observer 를 넣는 두 위치
+────────────────────────────────────────────────────────────────────────────────
+ Parallel split approach
+                                          ┌──────────────────────┐
+                                     ┌───►│         Load         │
+                                     │    └──────────────────────┘
+ ┌─────────┐    ┌───────────┐        │
+ │ Extract │───►│ Transform │────────┤
+ └─────────┘    └───────────┘        │
+                                     │    ┌──────────────────────┐
+                                     └───►│ Run the observation  │
+                                          │         job          │
+                                          └──────────────────────┘
+
+ Local sequencer approach
+ ┌─────────┐    ┌───────────┐    ┌──────┐    ┌──────────────────────┐
+ │ Extract │───►│ Transform │───►│ Load │───►│ Run the observation  │
+ └─────────┘    └───────────┘    └──────┘    │         job          │
+                                             └──────────────────────┘
+────────────────────────────────────────────────────────────────────────────────
+ Parallel split — 관찰과 적재를 동시에 ⇒ 빠르지만 "적재 이후 상태" 는 못 봄.
+ Local sequencer — 적재 뒤에 관찰 ⇒ 컨슈머가 실제로 보는 데이터셋을 검증하지만 완료가 늦어짐.
+```
+
+**스트리밍의 경우** — 관찰 로직을 **데이터 생성 잡 안으로 통합** 해야 함.
+배치 구현과 비슷하게 들리지만 **중대한 차이** 가 있음 —
+**관찰 단계를 별도 파이프라인으로 실행할 수 없다는 것**.
+결과적으로 **예상치 못한 에러나 메모리 이슈 같은 데이터 관찰 쪽 문제가 잡 전체에 영향**.
+**데이터셋을 샘플링** 해 이 위험을 완화할 수 있으나,
+그 과정에서 **일부 인사이트를 놓치게 된다는 사실을 받아들여야** 함.
+
+```
+[Figure 9-6 재현] 스트리밍 잡의 Online Observer — 관찰이 잡 안으로 들어옴
+──────────────────────────────────────────────────────────────────────────────────
+                  ┌───────────────────────────────────┐
+                  │        Data processing job        │
+                  │  ┌─────────────────────────────┐  │      ╭──────────────╮
+  ╭──────────╮    │  │ Write processed data to the │  │─────►│    Output    │
+  │  Input   │───►│  │       output location       │  │      │   location   │
+  │ location │    │  └─────────────────────────────┘  │      ╰──────────────╯
+  ╰──────────╯    │  ┌─────────────────────────────┐  │      ╭──────────────╮
+                  │  │  Write data observation to  │  │─────►│ Observation  │
+                  │  │   the observation location  │  │      │   location   │
+                  │  └─────────────────────────────┘  │      ╰──────────────╯
+                  └───────────────────────────────────┘
+──────────────────────────────────────────────────────────────────────────────────
+ ⚠ 두 쓰기가 같은 잡 안에 있음 ⇒ 관찰 쪽 OOM 이 데이터 생성까지 함께 멈춤.
+ ⇒ 완화책은 샘플링 — 대신 놓치는 인사이트를 감수.
+```
+
+> **참고 사항 — 데이터만이 아님 (Not Only the Data)**
+> 이 절은 **처리된 데이터에 관한 관찰 가능성** 을 다루지만,
+> 관찰 가능성은 **더 넓은 범위** 를 포괄.
+> **CPU · 메모리 · 디스크 사용량** 같은 **기술 메타데이터** 도 포함.
+> 대부분 **준실시간(near real-time) 측정** 이므로 **Online Observer 패턴에서 가용**.
+
+#### 고려사항 (Consequences)
+
+Online Observer 는 Offline Observer 의 **시점 정확성 문제를 해결** 하지만 함정이 있음.
+
+- **Extra delays (추가 지연)**
+  - **Local Sequencer 방식** 으로 관찰 잡을 통합하면 **파이프라인 끝에 단계가 하나 더 붙음**.
+  - 당연히 **파이프라인 완료가 지연** 됨.
+    메인 워크플로에 이 모니터링 단계를 추가하는 일이 **공짜가 아니라는 점** 을 기억할 것.
+- **Parallel splits (병렬 분할)**
+  - **Parallel Split 방식** 은 **관찰과 적재를 동시에 실행** 해 병렬성을 더함.
+    그러나 **부분적으로만 유효한 데이터셋을 관찰할 위험** 을 함께 들여옴.
+  - 책의 예 — **날짜/시간 속성을 가진 데이터셋을 데이터베이스에 적재** 하는 상황.
+    **날짜/시간 포맷이 DB 가 기대하는 것과 다르면 DB 에는 그 값들이 누락**.
+    그런데 **관찰 단계는 이 이슈를 보지 못함**.
+  - **완화책 1** — **Local Sequencer 방식** 을 써서 **컨슈머 (다운스트림)에게 실제로 노출되는 데이터셋** 을 관찰.
+  - **완화책 2** — 관찰 범위를 **처리는 되었지만 노출되지 않은 데이터셋** 으로 한정.
+    이 논리에서는 관찰이 **적재 태스크 대신 변환(transformation)에 초점**.
+    다만 **지금은 적재 이슈가 없더라도 이 전략이 파이프라인 전체 수명 동안 적절하지 않을 수 있음**.
+
+#### 구현 예시 (Examples)
+
+관찰 코드 자체는 **Offline Observer 와 동일** 하므로 생략.
+대신 **오프라인 관찰 코드를 더 반응적인 온라인 코드로 바꾸는 방법** 을 확인.
+
+**예시 1 — Airflow 배치 파이프라인에 관찰을 병합 (Example 9-25)**
+
+배치 파이프라인이 이제 **데이터 관찰 단계를 데이터 처리 파이프라인에 통합**:
+
+```python
+wait_for_new_data = SqlSensor(...)
+record_new_synchronization_state = PostgresOperator(...)
+clean_previously_added_visits = PostgresOperator(...)
+copy_new_visits = PostgresOperator(...)
+record_new_observation_state = PostgresOperator(...)   # Example 9-19 의 관찰 태스크가
+insert_new_observations = PostgresOperator(...)        # 같은 DAG 안으로 들어옴
+
+wait_for_new_data >> record_new_synchronization_state
+  >> clean_previously_added_visits >> copy_new_visits
+copy_new_visits >> record_new_observation_state >> insert_new_observations
+```
+
+**관찰 실패가 파이프라인 실패가 되는 위험** 을 어떻게 다룰 것인가.
+**아무 일도 하지 않는 최종 태스크를 추가** 하고, 이 태스크가 **관찰 잡과 독립적으로 트리거** 되게 함.
+그러면 **관찰이 실패해도 이 태스크의 실행이 파이프라인을 성공으로 표시**.
+Apache Airflow 에서는 **트리거 규칙을 `all_done` 으로 설정** 해 달성.
+
+```
+[관찰 실패를 파이프라인 실패로 만들지 않기]
+──────────────────────────────────────────────────────────────────────
+ copy_new_visits ✓
+      ├─► record_new_observation_state ─► insert_new_observations  ✗ 실패
+      │
+      └──────────────────────────────────────────────────► final_task
+                                                            trigger_rule = all_done
+                                                            ⇒ DAG 는 ✓ success
+──────────────────────────────────────────────────────────────────────
+ ⇒ 데이터는 이미 배포됐으므로, 관찰이 죽었다고 배포까지 실패로 되돌릴 이유가 없음.
+ ⚠ 대신 관찰 태스크의 실패는 별도 알림 채널로 반드시 드러낼 것 (조용한 관찰 공백 방지).
+```
+
+**예시 2 — 스트리밍의 lag 탐지 적응 (Example 9-26)**
+
+스트리밍에서도 코드가 병합되는데, **두 가지 큰 변화** 를 수반 — **lag 탐지** 와 **accumulator**.
+데이터 리더가 이제 **파티션 번호** 와 **오프셋 위치** 두 컬럼을 더 포함하고,
+lag 탐지기는 이를 이용해 **마이크로배치에서 가장 최근에 처리된 레코드** 를 얻음:
+
+```python
+@dataclasses.dataclass
+class PartitionWithOffset:
+ partition: int
+ offset: int
+
+
+class PartitionToMaxOffsetAccumulatorParam(AccumulatorParam):
+ def zero(self, default_max: PartitionWithOffset):
+  return []
+
+ def addInPlace(self, partitions_with_offsets: List[PartitionWithOffset],
+    new_max_candidate: PartitionWithOffset):
+  partitions_with_offsets.append(new_max_candidate)
+  return partitions_with_offsets
+
+def write_to_kafka_with_observer(visits: DataFrame, batch_number: int):
+ ctx = visits_to_analyze.sparkSession.sparkContext
+ max_offsets_tracker = ctx.accumulator([], PartitionToMaxOffsetAccumulatorParam())
+
+ def analyze_generated_records(visits_iterator: Iterator[Row]):
+   for visit_record in visits_iterator:
+    # ...
+      if visit_record.offset > max_local_offset:
+       max_local_offset = visit_record.offset      # 파티션별 최대 오프셋 추적
+      current_partition = visit_record.partition
+
+      max_offsets_tracker.add(PartitionWithOffset(partition=current_partition,
+       offset=max_local_offset))
+
+ visits_to_analyze.foreachPartition(analyze_generated_records)
+```
+
+**예시 3 — 무효 레코드 요약 (Example 9-27)**
+
+또 다른 수정은 **accumulator 사용** —
+**무효 row 수와 파티션별 최대 오프셋을 동시에 만들어 내는 복잡한 SQL 쿼리를 피하기 위함**:
+
+```python
+accumulators = {'event_time': spark_context.accumulator(0),
+  'user_id': spark_context.accumulator(0), 'page': spark_context.accumulator(0)}
+all_events_accumulator = spark_context.accumulator(0)
+
+def analyze_generated_records(visits_iterator: Iterator[Row]):
+ for visit_record in visits_iterator:
+  if not visit_record.event_time:
+   accumulators['event_time'].add(1)     # 레코드를 훑는 김에 같이 셈
+  if not visit_record.user_id:
+   accumulators['user_id'].add(1)
+  if not visit_record.page:
+   accumulators['page'].add(1)
+# ...
+
+observation_dump = {
+ '@timestamp': datetime.utcnow().isoformat(),
+ 'invalid_event_time': accumulators['event_time'].value,   # value 호출 시점에 집계됨
+ 'invalid_user_id': accumulators['user_id'].value,
+ 'invalid_page': accumulators['page'].value,
+ 'all_events': all_events_accumulator.value,
+# ...
+```
+
+> **참고 사항 — Spark accumulator 의 동작**
+> accumulator 는 **Apache Spark 전용 컴포넌트** 로,
+> **`value` 메서드를 호출하지 않는 한 각 executor 에서 로컬로 동작**.
+> `value` 함수가 실제로 호출되면 **executor 들이 로컬 accumulator 를 클러스터 메인 노드로 전송** 하고,
+> 메인 노드가 결과를 집계.
+> 이 데이터 관찰 예시에서 accumulator 는 **입력 데이터셋을 두 번 쿼리하는 일**
+> (한 번은 lag, 한 번은 무효 컬럼)을 **피하는 훌륭한 방법**.
+
+#### 비교 — #63 Offline Observer 와 #64 Online Observer
+
+| 항목 | #63 Offline Observer | #64 Online Observer |
+|---|---|---|
+| **관찰 잡의 위치** | 별도 파이프라인 (분리) | 생성 파이프라인 내부 (내장) |
+| **인사이트 도달 시점** | 관찰 잡 스케줄에 따름 (최대 며칠 지연) | 데이터 생성 직후 |
+| **생성 파이프라인 영향** | 없음 | 지연 추가 · 실패 전파 가능 |
+| **배치 구현** | 독립 DAG + row ID 경계 고정 | Parallel Split(#37) 또는 Local Sequencer(#33) |
+| **스트리밍 구현** | 처리 결과 위에 별도 잡 | 생성 잡 안에 통합 (분리 불가) |
+| **주요 함정** | 인사이트가 늦음 · 몰아 처리 시 컴퓨트 폭증 | 완료 지연 · Parallel Split 의 관찰 범위 불일치 |
+| **완화책** | 관찰 주기 단축 · 샘플링 | `all_done` 트리거 · 샘플링 · Local Sequencer 선택 |
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — Parallel Split 로 관찰을 붙이면 "적재 단계에서 깨진 데이터" 를 영원히 못 봄.</summary>
+<div markdown="1">
+
+**예 —** 변환 결과를 관찰하면서 동시에 PostgreSQL 로 적재하도록 Parallel Split 을 구성함.
+변환 출력의 `event_time` 은 `2024-01-01T01:00:00+09:00` 형식이었는데
+대상 컬럼이 `TIMESTAMP WITHOUT TIME ZONE` 이라 **적재 시 오프셋이 잘려 9시간 밀림**.
+관찰 잡은 변환 출력만 보므로 **`invalid_event_time = 0`** 을 계속 보고했고,
+분석가가 리포트 시각이 이상하다고 지적할 때까지 **3주간 정상으로 표시**됨.
+
+**권장 —** 컨슈머가 실제로 읽는 대상이 적재 결과라면 **Local Sequencer 로 적재 뒤에 관찰** 할 것.
+속도 때문에 Parallel Split 을 쓴다면, **관찰 범위가 변환까지라는 사실을 대시보드에 명시** 할 것.
+
+</div>
+</details>
+
+<details>
+<summary><b>⚠ 트러블 로그</b> — 스트리밍 잡에 관찰을 내장하면서 프로파일링까지 넣으면 생성 잡이 함께 죽음.</summary>
+<div markdown="1">
+
+**예 —** Structured Streaming 의 `foreachBatch` 안에서 `ProfileReport` 를 매 마이크로배치마다 호출함.
+트래픽이 몰린 저녁 시간대에 배치 크기가 커지자 **프로파일링이 드라이버 메모리를 소진** 했고,
+**데이터 생성 자체가 멈춰** Kafka 컨슈머 lag 이 40분치까지 밀림.
+관찰을 붙인 목적이 "빨리 알기" 였는데 정작 **파이프라인을 세운 원인** 이 됨.
+
+**권장 —** 스트리밍에서는 **가벼운 집계(accumulator)만 잡 안에 두고**,
+프로파일링처럼 무거운 작업은 **샘플링하거나 Offline Observer 로 분리** 할 것.
+
+</div>
+</details>
+
+---
+
+## 4. 요약
 
 챕터 9 는 **"이 데이터를 믿어도 되는가"** 를 **값을 막고(9.1 품질 확보)** →
 **스키마를 막고(9.2 스키마 일관성)** → **막는 규칙 자체를 지켜보는(9.3 품질 관찰)** 세 단계로 다룸.
-본 문서는 그중 **#59~#61** 을 정리.
 
 - **품질 확보** — 신뢰할 만한 데이터셋을 만드는 **서로 다른 계층의 방어선**.
   #59 **AWAP** 은 **파이프라인 계층** 에서, 입력과 출력 양쪽에 감사 단계를 두어
@@ -961,19 +1712,28 @@ Delta 가 **조용히 새 컬럼을 추가** 해 버림. 원래 `event_time` 은
 - **스키마 일관성** — 값이 아니라 **계약(contract)** 을 지키는 일.
   #61 **Schema Compatibility Enforcer** 는 **외부 컴포넌트** 를 통해 스키마를 일관되게 유지하며,
   **컨슈머 (다운스트림)를 깨는 스키마 변경을 애초에 거부**.
-- **남은 문제** — 제약과 제어는 저품질 데이터셋의 발행을 막지만,
+  #62 **Schema Migrator** 는 반대로 **의도한 파괴적 변경을 안전하게 통과** 시킴 —
+  핵심 장치는 규칙이 아니라 **유예 기간**.
+- **품질 관찰** — 제약과 제어는 저품질 데이터셋의 발행을 막지만,
   **이슈가 없음을 보장하지는 않음**. 정확히는 **내가 정의한 규칙에 대해서만** 이슈가 없음을 보장.
   규칙 정의를 빠뜨릴 수도, 진화한 데이터셋에 맞춰 조정해야 할 수도 있음.
-  ⇒ 그래서 **9.3 품질 관찰(#63 Offline Observer · #64 Online Observer)** 이 필요.
+  #63 **Offline Observer** 와 #64 **Online Observer** 가 그 규칙을 갱신할 입력을 만듦.
+  둘의 차이는 **무엇을 재느냐가 아니라 언제 재느냐**.
+- **남은 문제** — 챕터 9 의 모든 패턴은 **잡이 돌고 있다** 는 전제 위에 서 있음.
+  업스트림 흐름이 끊겨 **AWAP 잡 자체가 실행되지 않으면** 감사도 제약도 옵서버도 전부 침묵.
+  ⇒ 그래서 **챕터 10 데이터 관찰 가능성(#65 Flow Interruption Detector 부터)** 이 필요.
 
 | 패턴 | 카테고리 | 한 줄 요약 | 핵심 트레이드오프 |
 |---|---|---|---|
 | #59 AWAP | Quality Enforcement | 파이프라인이 완전한 데이터셋 위에서 동작하고 <br>저품질 데이터를 노출하지 않게 보장 | 데이터 관련 검증의 컴퓨팅 비용 / <br>완벽하지 않고 시간이 지나면 규칙 조정 필요 · 추가 지연 |
 | #60 Constraints Enforcer | Quality Enforcement | 프로듀서가 데이터 품질 이슈를 <br>도입하지 못하게 보장 | 선언만 하면 DB 가 강제 / <br>all-or-nothing 으로 인한 긴 왕복 · 컨슈머마다 다른 기대 |
 | #61 Schema Compatibility Enforcer | Schema Consistency | 스키마 변경이 컨슈머와 <br>호환되도록 보장 | 깨는 변경을 사전 차단 / <br>스키마 레지스트리 통신 오버헤드 · 어려워지는 스키마 진화 |
+| #62 Schema Migrator | Schema Consistency | 컨슈머 (다운스트림)를 깨지 않고 <br>스키마를 마이그레이션 | 파괴적 변경을 안전하게 수행 / <br>레코드 크기가 크게 늘 수 있음 · 때로는 필드를 제거할 수 없음 |
+| #63 Offline Observer | Quality Observation | 관찰을 별도 파이프라인으로 <br>구현 | 생성 파이프라인에 영향 없음 / <br>인사이트가 늦을 수 있음 · 관찰 데이터셋 처리에 컴퓨트가 과대해질 수 있음 |
+| #64 Online Observer | Quality Observation | 관찰을 관찰 대상 파이프라인의 <br>일부로 구현 | 생성 직후 인사이트 / <br>추가 처리 지연 · Parallel Split 은 빠르지만 관찰 범위가 달라질 수 있음 |
 
 ```
-[챕터 9 선택 가이드 — #59~#61]
+[챕터 9 선택 가이드 — #59~#64]
 ──────────────────────────────────────────────────────────────────────
  ① 잡은 성공했는데 숫자가 틀릴 때
    볼륨 급감·분포 이상처럼 "값의 관계" 가 문제  ─► #59 AWAP (2차 감사, 데이터셋 수준 검증)
@@ -992,9 +1752,23 @@ Delta 가 **조용히 새 컬럼을 추가** 해 버림. 원래 `event_time` 은
    프로듀서 여럿 · 명시적 호환성 모드가 필요      ─► #61 · 외부 서비스 (Schema Registry)
    테이블에 쓰는 순간 막으면 충분                ─► #61 · 암묵적 (Delta Lake · RDB)
    DDL 자체를 통제해야 함                       ─► #61 · DDL 이벤트 트리거 (또는 ALTER 권한 회수)
+
+ ⑤ 스키마를 의도적으로 바꿔야 할 때
+   필드 이름이 나쁨 · 타입을 바꾸고 싶음         ─► #62 (새 필드 추가 후 유예 기간)
+   필드를 지우고 싶은데 사용처를 모름            ─► #62 + #70 Fine-Grained Tracker
+   전이(transitive) 호환성이 걸려 있음           ─► 먼저 비전이로 낮출 것 (#62 의 전제)
+
+ ⑥ 규칙이 낡았는지 지켜봐야 할 때
+   지금은 문제없고 생성 파이프라인을 못 건드림    ─► #63 Offline Observer
+   야간 일괄로 자원 경합을 피하고 싶음            ─► #63 Offline Observer
+   컨슈머보다 먼저 알아야 함 (주 1회로는 늦음)    ─► #64 Online Observer
+   배치이고 완료 지연을 감수 가능                ─► #64 · Local Sequencer (#33)
+   배치이고 속도가 중요 · 관찰 범위 한정 수용     ─► #64 · Parallel Split (#37)
+   스트리밍                                    ─► #64 · 잡 내부 통합 (+ 샘플링)
 ──────────────────────────────────────────────────────────────────────
  ⚠ AWAP 은 1차 감사의 이중 읽기와 스트리밍 지연을, 제약은 all-or-nothing 롤백을,
-   호환성 강제는 전이 모드로 인한 진화 봉쇄를 각각 조심할 것.
+   호환성 강제는 전이 모드로 인한 진화 봉쇄를, #62 는 유예 기간의 종료일을,
+   #63 은 관찰의 멱등성을, #64 는 관찰 실패의 전파를 각각 조심할 것.
 ```
 
 **정리 1 — 계층이 다르지 두 패턴이 경쟁하지 않음** — #59 는 **파이프라인 안**, #60 은 **저장 계층**.
@@ -1007,15 +1781,27 @@ Delta 테이블이었다면 그 검사는 `#60` 이 대신했을 것.
 **감사 → 쓰기(스테이징) → 감사 → 배포** 에서 **Load 가 마지막** 이라는 점이 패턴의 전부라고 해도 됨.
 스테이징 계층이 없으면 감사는 사후 부검이 되고, 잘못된 숫자는 이미 컨슈머 (조회하는 쪽)의 화면에 도달함.
 
-**정리 3 — 강제는 "규칙이 맞다" 는 가정 위에 서 있음** — #59 의 *Rules coverage*,
+**정리 3 — #61 과 #62 는 방향이 반대인 한 쌍** — `#61` 은 **도구가 사람의 선의를 대신 막아 주는 패턴**,
+`#62` 는 **도구가 막을 수 없는 변경을 사람의 합의로 통과시키는 절차**.
+그래서 `#62` 에서 기술적인 부분은 `ADD COLUMN` 한 줄뿐이고,
+나머지는 전부 **컨슈머와 전환 기간을 합의하는 일**. 데드라인이 없으면 패턴 자체가 성립하지 않음.
+`#62` 가 **전이 호환성이 아닐 것** 을 전제하는 이유도 같음 —
+전이 모드에서는 필드 제거·이름 변경이 애초에 불가능하기 때문.
+
+**정리 4 — 관찰은 감사가 아님** — 책이 `Observability Versus Auditing` 박스를 따로 둔 이유.
+**감사(#59 AWAP)는 차단하고, 관찰(#63·#64)은 차단하지 않음**.
+그래서 관찰 결과는 파이프라인을 세우는 데 쓰이는 것이 아니라,
+**다음 번 강제 규칙을 무엇으로 정할지 결정하는 입력** 으로 쓰임.
+`#64` 예시가 `all_done` 트리거로 관찰 실패를 흡수하는 것도 같은 이유.
+
+**정리 5 — 강제는 "규칙이 맞다" 는 가정 위에 서 있음** — #59 의 *Rules coverage*,
 *An issue may not be an issue* 두 고려사항이 같은 이야기를 함.
 **볼륨이 3배로 뛴 것이 사고가 아니라 성공** 일 수 있고, **오늘의 규칙이 내일의 데이터** 를 못 덮을 수 있음.
 그래서 감사 결과를 **차단/경고 두 등급** 으로 나누고,
-규칙의 유효성 자체를 **9.3 품질 관찰(#63·#64)** 로 계속 갱신해야 함.
+규칙의 유효성 자체를 **#63·#64 로 계속 갱신** 해야 함.
 
 > 제약과 제어를 강제해도 **이슈가 없음이 보장되지는 않음** — 보장되는 것은
 > **내가 정의한 규칙에 대해서만 이슈가 없다** 는 사실뿐.
-> ※ 본 문서에서 다루지 않은 **#62 Schema Migrator** — 필드 이름 변경·타입 진화 같은
-> **의도적인 파괴적 변경** 을 컨슈머 (다운스트림)를 깨지 않고 수행하는 패턴.
-> **전이(transitive) 호환성이 아닐 것** 을 전제로 함 —
-> 전이 모드에서는 필드 제거·이름 변경이 애초에 불가능하기 때문.
+> ※ 챕터 9 의 패턴은 모두 **데이터가 도착했다** 는 전제 위에서 동작.
+> 그 전제가 깨지는 순간을 감시하는 것이 **챕터 10 의 #65 Flow Interruption Detector** —
+> 감시 대상을 **프로세스 상태에서 출력 데이터의 신선도로** 옮김.
